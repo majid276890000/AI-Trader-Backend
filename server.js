@@ -7,6 +7,8 @@ let balance = 1000;
 
 const server = http.createServer((req, res) => {
 
+res.setHeader("Access-Control-Allow-Origin", "*");
+res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   res.writeHead(200, {
     "Content-Type": "application/json"
   });
