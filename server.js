@@ -5,18 +5,22 @@ const PORT = 3000;
 let botStatus = "stopped";
 let balance = 1000;
 
+let settings = {
+  mode: "low-risk",
+  capital: 1000
+};
+
 const server = http.createServer((req, res) => {
 
-res.setHeader("Access-Control-Allow-Origin", "*");
-res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-  res.writeHead(200, {
-    "Content-Type": "application/json"
-  });
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Content-Type", "application/json");
 
   if (req.url === "/status") {
     res.end(JSON.stringify({
       bot: botStatus,
-      balance: balance
+      balance: balance,
+      settings: settings
     }));
     return;
   }
@@ -38,6 +42,11 @@ res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
       message: "Bot stopped",
       bot: botStatus
     }));
+    return;
+  }
+
+  if (req.url === "/settings") {
+    res.end(JSON.stringify(settings));
     return;
   }
 
