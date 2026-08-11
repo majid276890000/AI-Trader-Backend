@@ -13,6 +13,50 @@ let settings = {
   capital: 1000
 };
 let priceHistory = [];
+let cachedBTCPrice = null;
+let cachedPriceTime = 0;
+const PRICE_CACHE_MS = 30000;
+
+async function getBTCPrice() {
+  const now = Date.now();
+
+  if (
+    cachedBTCPrice !== null &&
+    now - cachedPriceTime < PRICE_CACHE_MS
+  ) {
+    return cachedBTCPrice;
+  }
+
+  try {
+    const response = await fetch(
+      "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
+    );
+
+    if (!response.ok) {
+      throw new Error(`CoinGecko HTTP ${response.status}`);
+    }
+
+    const data = await response.json();
+
+    if (!data.bitcoin || typeof data.bitcoin.usd !== "number") {
+      throw new Error("Invalid BTC price data");
+    }
+
+    cachedBTCPrice = data.bitcoin.usd;
+    cachedPriceTime = now;
+
+    return cachedBTCPrice;
+
+  } catch (error) {
+    if (cachedBTCPrice !== null) {
+      console.log("Using cached BTC price:", cachedBTCPrice);
+      return cachedBTCPrice;
+    }
+
+    throw error;
+  }
+}
+
 async function runAutoTradeCycle() {
   if (autoTradeRunning) return;
 
@@ -124,17 +168,12 @@ const server = http.createServer(async (req, res) => {
 
   if (req.url === "/price") {
     try {
-      const response = await fetch(
-        "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
-      );
+      const price = await getBTCPrice();
 
-      const data = await response.json();
-
-      res.end(JSON.stringify({
-        symbol: "BTC/USDT",
-        price: data.bitcoin.usd
-      }));
-
+res.end(JSON.stringify({
+  symbol: "BTC/USDT",
+  price: price
+}));
     } catch (error) {
       res.end(JSON.stringify({
         error: "Could not fetch BTC price"
@@ -142,73 +181,71 @@ const server = http.createServer(async (req, res) => {
     }
 
     return;
-  }
+  
+    }
+    if (req.url === "/analysis") {
+  try {
+    const price = await getBTCPrice();
+    priceHistory.push(price);
 
-  if (req.url === "/analysis") {
-    try {
-      const response = await fetch(
-        "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
-      );
-
-      const data = await response.json();
-      const price = data.bitcoin.usd;
-
-      priceHistory.push(price);
-
-      if (priceHistory.length > 10) {
-        priceHistory.shift();
-      }
-
-      let signal = "WAIT";
-      let risk = "LOW";
-      let confidence = 60;
-      let trend = "NEUTRAL";
-
-      if (priceHistory.length >= 2) {
-        const firstPrice = priceHistory[0];
-        const changePercent =
-          ((price - firstPrice) / firstPrice) * 100;
-
-        if (changePercent > 0.30) {
-  trend = "UP";
-
-  confidence = Math.min(
-    85,
-    Math.round(65 + changePercent * 10)
-  );
-
-  signal = confidence >= 70 ? "CHECK_BUY" : "WAIT";
-
-} else if (changePercent < -0.15) {
-  trend = "DOWN";
-  signal = "WAIT";
-  confidence = 70;
-        } else {
-          trend = "NEUTRAL";
-          signal = "WAIT";
-          confidence = 60;
-        }
-      }
-
-      res.end(JSON.stringify({
-        symbol: "BTC/USDT",
-        price: price,
-        signal: signal,
-        risk: risk,
-        confidence: confidence,
-        trend: trend,
-        samples: priceHistory.length
-      }));
-
-    } catch (error) {
-      res.end(JSON.stringify({
-        error: "Could not analyze BTC"
-      }));
+    if (priceHistory.length > 10) {
+      priceHistory.shift();
     }
 
-    return;
+    let signal = "WAIT";
+    let risk = "LOW";
+    let confidence = 60;
+    let trend = "NEUTRAL";
+
+    if (priceHistory.length >= 2) {
+      const firstPrice = priceHistory[0];
+
+      const changePercent =
+        ((price - firstPrice) / firstPrice) * 100;
+
+      if (changePercent > 0.30) {
+        trend = "UP";
+
+        confidence = Math.min(
+          85,
+          Math.round(65 + changePercent * 10)
+        );
+
+        signal = confidence >= 70 ? "CHECK_BUY" : "WAIT";
+
+      } else if (changePercent < -0.15) {
+        trend = "DOWN";
+        signal = "WAIT";
+        confidence = 70;
+
+      } else {
+        trend = "NEUTRAL";
+        signal = "WAIT";
+        confidence = 60;
+      }
+    }
+
+    res.end(JSON.stringify({
+      symbol: "BTC/USDT",
+      price: price,
+      signal: signal,
+      risk: risk,
+      confidence: confidence,
+      trend: trend,
+      samples: priceHistory.length
+    }));
+
+  } catch (error) {
+    console.log("Analysis error:", error.message);
+
+    res.end(JSON.stringify({
+      error: "Could not analyze BTC",
+      message: "Temporary price service error"
+    }));
   }
 
+  return;
+}
   if (req.url === "/paper-buy") {
     if (paperPosition > 0) {
       res.end(JSON.stringify({
@@ -221,13 +258,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    const response = await fetch(
-      "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
-    );
-
-    const data = await response.json();
-    const price = data.bitcoin.usd;
-
+    const price = await getBTCPrice();
     const tradeCapital = Math.min(100, balance);
     paperPosition = tradeCapital / price;
     paperEntryPrice = price;
