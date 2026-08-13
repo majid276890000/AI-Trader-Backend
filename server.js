@@ -31,12 +31,14 @@ async function getBTCPrice() {
     const response = await fetch(
       "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
 );
+console.log("CoinGecko status:", response.status);
     if (!response.ok) {
       throw new Error(`CoinGecko HTTP ${response.status}`);
     }
 
     const data = await response.json();
 
+console.log("CoinGecko data:", data);
     if (!data.bitcoin || typeof data.bitcoin.usd !== "number") {
       throw new Error("Invalid BTC price data");
     }
@@ -166,22 +168,24 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.url === "/price") {
-    try {
-      const price = await getBTCPrice();
+  try {
+    const price = await getBTCPrice();
 
-res.end(JSON.stringify({
-  symbol: "BTC/USDT",
-  price: price
-}));
-    } catch (error) {
-      res.end(JSON.stringify({
-        error: "Could not fetch BTC price"
-      }));
-    }
+    res.end(JSON.stringify({
+      symbol: "BTC/USDT",
+      price: price
+    }));
 
-    return;
-  
-    }
+  } catch (error) {
+    console.log("PRICE ERROR:", error);
+
+    res.end(JSON.stringify({
+      error: "Could not fetch BTC price"
+    }));
+  }
+
+  return;
+}
     if (req.url === "/analysis") {
   try {
     const price = await getBTCPrice();
