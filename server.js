@@ -29,22 +29,23 @@ async function getBTCPrice() {
 
   try {
     const response = await fetch(
-      "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
-);
-console.log("CoinGecko status:", response.status);
+      "https://min-api.cryptocompare.com/data/price?fsym=BTC&tsyms=USD"
+    );
+
     if (!response.ok) {
-      throw new Error(`CoinGecko HTTP ${response.status}`);
+      throw new Error(`CryptoCompare HTTP ${response.status}`);
     }
 
     const data = await response.json();
 
-console.log("CoinGecko data:", data);
-    if (!data.bitcoin || typeof data.bitcoin.usd !== "number") {
+    if (!data.USD) {
       throw new Error("Invalid BTC price data");
     }
 
-    cachedBTCPrice = data.bitcoin.usd;
+    cachedBTCPrice = data.USD;
     cachedPriceTime = now;
+
+    console.log("CryptoCompare BTC price:", cachedBTCPrice);
 
     return cachedBTCPrice;
 
@@ -57,7 +58,6 @@ console.log("CoinGecko data:", data);
     throw error;
   }
 }
-
 async function runAutoTradeCycle() {
   if (autoTradeRunning) return;
 
