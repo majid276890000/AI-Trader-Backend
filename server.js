@@ -29,23 +29,24 @@ async function getBTCPrice() {
 
   try {
     const response = await fetch(
-      "https://min-api.cryptocompare.com/data/price?fsym=BTC&tsyms=USD"
+      "https://api.coinpaprika.com/v1/tickers/btc-bitcoin"
     );
 
     if (!response.ok) {
-      throw new Error(`CryptoCompare HTTP ${response.status}`);
+      throw new Error(`CoinPaprika HTTP ${response.status}`);
     }
 
     const data = await response.json();
+    const price = data?.quotes?.USD?.price;
 
-    if (!data.USD) {
+    if (typeof price !== "number") {
       throw new Error("Invalid BTC price data");
     }
 
-    cachedBTCPrice = data.USD;
+    cachedBTCPrice = price;
     cachedPriceTime = now;
 
-    console.log("CryptoCompare BTC price:", cachedBTCPrice);
+    console.log("CoinPaprika BTC price:", cachedBTCPrice);
 
     return cachedBTCPrice;
 
