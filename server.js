@@ -15,7 +15,7 @@ let settings = {
 let priceHistory = [];
 let cachedBTCPrice = null;
 let cachedPriceTime = 0;
-const PRICE_CACHE_MS = 30000;
+const PRICE_CACHE_MS = 300000;
 
 async function getBTCPrice() {
   const now = Date.now();
