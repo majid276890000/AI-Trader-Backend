@@ -289,12 +289,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    const response = await fetch(
-      "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
-    );
-
-    const data = await response.json();
-    const price = data.bitcoin.usd;
+    const price = await getBTCPrice();
 
     const sellValue = paperPosition * price;
     const profit = sellValue - (paperPosition * paperEntryPrice);
