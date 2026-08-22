@@ -11,10 +11,17 @@ let balance = 1000;
 let paperPosition = 0;
 let paperEntryPrice = 0;
 
+
 // =========================
-// Wallet - Test Only
+// Wallet Ledger
 // =========================
-let walletBalance = 0;
+let wallet = {
+  currency: "USDT",
+  balance: 0,
+  availableBalance: 0,
+  lockedBalance: 0
+};
+
 let walletTransactions = [];
 
 // =========================
@@ -367,95 +374,108 @@ const server = http.createServer(
     // =========================
     if (req.url === "/wallet-status") {
 
-      res.end(JSON.stringify({
-        balance:
-          Number(
-            walletBalance.toFixed(2)
-          ),
+  res.end(JSON.stringify({
+    balance: Number(wallet.balance.toFixed(2)),
+    availableBalance: Number(
+      wallet.availableBalance.toFixed(2)
+    ),
+    lockedBalance: Number(
+      wallet.lockedBalance.toFixed(2)
+    ),
+    currency: wallet.currency
+  }));
 
-        currency: "USDT"
-      }));
-
-      return;
-    }
+  return;
+}
 
     // =========================
     // WALLET DEPOSIT - TEST
     // =========================
     if (req.url === "/wallet-deposit") {
 
-      const amount = 100;
+  const amount = 100;
 
-      walletBalance += amount;
+  wallet.balance += amount;
+  wallet.availableBalance += amount;
 
-      walletTransactions.push({
-        type: "DEPOSIT",
-        amount: amount,
-        currency: "USDT",
-        timestamp:
-          new Date().toISOString()
-      });
+  walletTransactions.push({
+    id: Date.now(),
+    type: "DEPOSIT",
+    amount: amount,
+    currency: wallet.currency,
+    status: "COMPLETED",
+    timestamp:
+      new Date().toISOString()
+  });
 
-      res.end(JSON.stringify({
-        ok: true,
-        action: "DEPOSIT",
-        amount: amount,
-        balance:
-          Number(
-            walletBalance.toFixed(2)
-          ),
-        currency: "USDT"
-      }));
+  res.end(JSON.stringify({
+    ok: true,
+    action: "DEPOSIT",
+    amount: amount,
+    balance:
+      Number(
+        wallet.balance.toFixed(2)
+      ),
+    availableBalance:
+      Number(
+        wallet.availableBalance.toFixed(2)
+      ),
+    lockedBalance:
+      Number(
+        wallet.lockedBalance.toFixed(2)
+      ),
+    currency: wallet.currency
+  }));
 
-      return;
-    }
+  return;
+}
 
     // =========================
     // WALLET WITHDRAW - TEST
     // =========================
     if (req.url === "/wallet-withdraw") {
 
-      const amount = 20;
+  const amount = 20;
 
-      if (amount > walletBalance) {
+  if (amount > wallet.availableBalance) {
 
-        res.end(JSON.stringify({
-          ok: false,
-          message:
-            "Insufficient wallet balance",
+    res.end(JSON.stringify({
+      ok: false,
+      message: "Insufficient available wallet balance",
+      balance: Number(wallet.balance.toFixed(2)),
+      availableBalance: Number(wallet.availableBalance.toFixed(2)),
+      lockedBalance: Number(wallet.lockedBalance.toFixed(2)),
+      currency: wallet.currency
+    }));
 
-          balance:
-            Number(
-              walletBalance.toFixed(2)
-            )
-        }));
+    return;
+  }
 
-        return;
-      }
+  wallet.availableBalance -= amount;
+  wallet.lockedBalance += amount;
 
-      walletBalance -= amount;
+  walletTransactions.push({
+    id: Date.now(),
+    type: "WITHDRAW",
+    amount: amount,
+    currency: wallet.currency,
+    status: "PENDING",
+    timestamp: new Date().toISOString()
+  });
 
-      walletTransactions.push({
-        type: "WITHDRAW",
-        amount: amount,
-        currency: "USDT",
-        timestamp:
-          new Date().toISOString()
-      });
+  res.end(JSON.stringify({
+    ok: true,
+    action: "WITHDRAW",
+    amount: amount,
+    balance: Number(wallet.balance.toFixed(2)),
+    availableBalance: Number(wallet.availableBalance.toFixed(2)),
+    lockedBalance: Number(wallet.lockedBalance.toFixed(2)),
+    status: "PENDING",
+    currency: wallet.currency
+  }));
 
-      res.end(JSON.stringify({
-        ok: true,
-        action: "WITHDRAW",
-        amount: amount,
-        balance:
-          Number(
-            walletBalance.toFixed(2)
-          ),
-        currency: "USDT"
-      }));
-
-      return;
-    }
+  return;
+}
 
     // =========================
     // WALLET TRANSACTIONS
@@ -474,6 +494,108 @@ const server = http.createServer(
 
       return;
     }
+
+// =========================
+// WALLET CONFIRM WITHDRAW
+// =========================
+// =========================
+// WALLET CONFIRM WITHDRAW
+// =========================
+const confirmUrl = new URL(
+  req.url,
+  "http://localhost"
+);
+
+if (confirmUrl.pathname === "/wallet-confirm-withdraw") {
+
+  const transactionId =
+    Number(confirmUrl.searchParams.get("id"));
+
+  if (!transactionId) {
+
+    res.end(JSON.stringify({
+      ok: false,
+      message: "Transaction id is required",
+      currency: wallet.currency
+    }));
+
+    return;
+  }
+
+  const pendingTransaction =
+    walletTransactions.find(
+      tx =>
+        tx.id === transactionId &&
+        tx.type === "WITHDRAW" &&
+        tx.status === "PENDING"
+    );
+
+  if (!pendingTransaction) {
+
+    res.end(JSON.stringify({
+      ok: false,
+      message: "Pending withdrawal not found",
+      transactionId: transactionId,
+      balance:
+        Number(wallet.balance.toFixed(2)),
+      availableBalance:
+        Number(wallet.availableBalance.toFixed(2)),
+      lockedBalance:
+        Number(wallet.lockedBalance.toFixed(2)),
+      currency: wallet.currency
+    }));
+
+    return;
+  }
+
+  const amount =
+    Number(pendingTransaction.amount);
+
+  if (amount > wallet.lockedBalance) {
+
+    res.end(JSON.stringify({
+      ok: false,
+      message: "Locked balance is insufficient",
+      transactionId: transactionId,
+      balance:
+        Number(wallet.balance.toFixed(2)),
+      availableBalance:
+        Number(wallet.availableBalance.toFixed(2)),
+      lockedBalance:
+        Number(wallet.lockedBalance.toFixed(2)),
+      currency: wallet.currency
+    }));
+
+    return;
+  }
+
+  wallet.balance -= amount;
+  wallet.lockedBalance -= amount;
+
+  pendingTransaction.status =
+    "COMPLETED";
+
+  pendingTransaction.confirmedAt =
+    new Date().toISOString();
+
+  res.end(JSON.stringify({
+    ok: true,
+    action: "WITHDRAW_CONFIRMED",
+    transactionId: transactionId,
+    amount: amount,
+    balance:
+      Number(wallet.balance.toFixed(2)),
+    availableBalance:
+      Number(wallet.availableBalance.toFixed(2)),
+    lockedBalance:
+      Number(wallet.lockedBalance.toFixed(2)),
+    status:
+      pendingTransaction.status,
+    currency: wallet.currency
+  }));
+
+  return;
+}
 
     // =========================
     // PAPER BUY
