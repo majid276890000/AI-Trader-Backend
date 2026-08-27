@@ -1,4 +1,20 @@
 const http = require("http");
+const { Pool } = require("pg");
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false
+  }
+});
+async function testDatabase() {
+  try {
+    const result = await pool.query("SELECT NOW()");
+    console.log("DATABASE OK:", result.rows[0]);
+  } catch (error) {
+    console.log("DATABASE ERROR:", error.message);
+  }
+}
 
 const PORT = 3000;
 
@@ -177,6 +193,17 @@ async function runAutoTradeCycle() {
 // =========================
 // HTTP Server
 // =========================
+async function testDatabase() {
+  try {
+    const result = await pool.query("SELECT NOW()");
+    console.log("DATABASE OK:", result.rows[0]);
+  } catch (error) {
+    console.log("DATABASE ERROR:", error.message);
+  }
+}
+
+testDatabase();
+
 const server = http.createServer(
   async (req, res) => {
 
