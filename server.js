@@ -15,7 +15,7 @@ async function testDatabase() {
     console.log("DATABASE ERROR:", error.message);
   }
 }
-
+testDatabase();
 const PORT = 3000;
 
 let botStatus = "stopped";
