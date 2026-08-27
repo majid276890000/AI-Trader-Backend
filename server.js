@@ -193,16 +193,6 @@ async function runAutoTradeCycle() {
 // =========================
 // HTTP Server
 // =========================
-async function testDatabase() {
-  try {
-    const result = await pool.query("SELECT NOW()");
-    console.log("DATABASE OK:", result.rows[0]);
-  } catch (error) {
-    console.log("DATABASE ERROR:", error.message);
-  }
-}
-
-testDatabase();
 
 const server = http.createServer(
   async (req, res) => {
