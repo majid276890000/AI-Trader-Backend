@@ -534,42 +534,111 @@ const server = http.createServer(
 
   const amount = 20;
 
-  if (amount > wallet.availableBalance) {
+  try {
+    const client = await pool.connect();
+
+    try {
+      await client.query("BEGIN");
+
+      const walletResult = await client.query(`
+        SELECT
+          w.id,
+          w.user_id,
+          w.balance,
+          w.locked_balance,
+          w.currency
+        FROM wallets w
+        JOIN users u ON u.id = w.user_id
+        WHERE u.telegram_id = $1
+        FOR UPDATE
+      `, [999999999]);
+
+      if (walletResult.rows.length === 0) {
+        await client.query("ROLLBACK");
+
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Wallet not found"
+        }));
+
+        return;
+      }
+
+      const row = walletResult.rows[0];
+      const balance = Number(row.balance);
+      const lockedBalance = Number(row.locked_balance);
+      const availableBalance = balance - lockedBalance;
+
+      if (amount > availableBalance) {
+        await client.query("ROLLBACK");
+
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Insufficient available wallet balance",
+          balance: Number(balance.toFixed(2)),
+          availableBalance: Number(availableBalance.toFixed(2)),
+          lockedBalance: Number(lockedBalance.toFixed(2)),
+          currency: row.currency
+        }));
+
+        return;
+      }
+
+      const newLockedBalance = lockedBalance + amount;
+
+      await client.query(`
+        UPDATE wallets
+        SET locked_balance = $1,
+            updated_at = NOW()
+        WHERE id = $2
+      `, [newLockedBalance, row.id]);
+
+      const transactionResult = await client.query(`
+        INSERT INTO wallet_transactions
+          (user_id, type, amount, currency, status, description)
+        VALUES
+          ($1, 'WITHDRAW', $2, $3, 'PENDING', 'Test withdrawal')
+        RETURNING id, created_at
+      `, [
+        row.user_id,
+        amount,
+        row.currency
+      ]);
+
+      await client.query("COMMIT");
+
+      res.end(JSON.stringify({
+        ok: true,
+        action: "WITHDRAW",
+        transactionId: transactionResult.rows[0].id,
+        amount: amount,
+        balance: Number(balance.toFixed(2)),
+        availableBalance: Number(
+          (balance - newLockedBalance).toFixed(2)
+        ),
+        lockedBalance: Number(newLockedBalance.toFixed(2)),
+        status: "PENDING",
+        currency: row.currency
+      }));
+
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+
+  } catch (error) {
+    console.log(
+      "WALLET WITHDRAW DATABASE ERROR:",
+      error.message
+    );
 
     res.end(JSON.stringify({
       ok: false,
-      message: "Insufficient available wallet balance",
-      balance: Number(wallet.balance.toFixed(2)),
-      availableBalance: Number(wallet.availableBalance.toFixed(2)),
-      lockedBalance: Number(wallet.lockedBalance.toFixed(2)),
-      currency: wallet.currency
+      message: "Database error"
     }));
-
-    return;
   }
-
-  wallet.availableBalance -= amount;
-  wallet.lockedBalance += amount;
-
-  walletTransactions.push({
-    id: Date.now(),
-    type: "WITHDRAW",
-    amount: amount,
-    currency: wallet.currency,
-    status: "PENDING",
-    timestamp: new Date().toISOString()
-  });
-
-  res.end(JSON.stringify({
-    ok: true,
-    action: "WITHDRAW",
-    amount: amount,
-    balance: Number(wallet.balance.toFixed(2)),
-    availableBalance: Number(wallet.availableBalance.toFixed(2)),
-    lockedBalance: Number(wallet.lockedBalance.toFixed(2)),
-    status: "PENDING",
-    currency: wallet.currency
-  }));
 
   return;
 }
