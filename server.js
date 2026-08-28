@@ -1,4 +1,5 @@
 const http = require("http");
+const crypto = require("crypto");
 const { Pool } = require("pg");
 
 const pool = new Pool({
@@ -16,6 +17,55 @@ async function testDatabase() {
   }
 }
 testDatabase();
+
+async function initDatabase() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        telegram_id BIGINT UNIQUE NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS wallets (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id),
+        balance NUMERIC(20,8) NOT NULL DEFAULT 0,
+        locked_balance NUMERIC(20,8) NOT NULL DEFAULT 0,
+        currency VARCHAR(10) NOT NULL DEFAULT USDT,
+        updated_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE(user_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS wallet_transactions (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id),
+        type VARCHAR(20) NOT NULL,
+        amount NUMERIC(20,8) NOT NULL,
+        currency VARCHAR(10) NOT NULL DEFAULT USDT,
+        status VARCHAR(20) NOT NULL,
+        description TEXT,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+
+      INSERT INTO users (telegram_id)
+      VALUES (999999999)
+      ON CONFLICT (telegram_id) DO NOTHING;
+
+      INSERT INTO wallets (user_id, balance, locked_balance, currency)
+      SELECT id, 0, 0, USDT
+      FROM users
+      WHERE telegram_id = 999999999
+      ON CONFLICT (user_id) DO NOTHING;
+    `);
+
+    console.log("DATABASE TABLES OK");
+  } catch (error) {
+    console.log("DATABASE INIT ERROR:", error.message);
+  }
+}
+
+initDatabase();
 const PORT = 3000;
 
 let botStatus = "stopped";
