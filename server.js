@@ -577,17 +577,42 @@ const server = http.createServer(
     // =========================
     // WALLET TRANSACTIONS
     // =========================
-    if (
-      req.url ===
-      "/wallet-transactions"
-    ) {
+    if (req.url === "/wallet-transactions") {
 
-      res.end(JSON.stringify({
-        ok: true,
-        currency: "USDT",
-        transactions:
-          walletTransactions
-      }));
+      try {
+        const result = await pool.query(`
+          SELECT
+            wt.id,
+            wt.type,
+            wt.amount,
+            wt.currency,
+            wt.status,
+            wt.description,
+            wt.created_at
+          FROM wallet_transactions wt
+          JOIN users u ON u.id = wt.user_id
+          WHERE u.telegram_id = $1
+          ORDER BY wt.created_at DESC
+        `, [999999999]);
+
+        res.end(JSON.stringify({
+          ok: true,
+          currency: "USDT",
+          transactions: result.rows
+        }));
+
+      } catch (error) {
+        console.log(
+          "WALLET TRANSACTIONS DATABASE ERROR:",
+          error.message
+        );
+
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Database error",
+          transactions: []
+        }));
+      }
 
       return;
     }
