@@ -391,16 +391,47 @@ const server = http.createServer(
     // =========================
     if (req.url === "/wallet-status") {
 
-  res.end(JSON.stringify({
-    balance: Number(wallet.balance.toFixed(2)),
-    availableBalance: Number(
-      wallet.availableBalance.toFixed(2)
-    ),
-    lockedBalance: Number(
-      wallet.lockedBalance.toFixed(2)
-    ),
-    currency: wallet.currency
-  }));
+  try {
+    const result = await pool.query(`
+      SELECT
+        w.balance,
+        w.locked_balance,
+        w.currency
+      FROM wallets w
+      JOIN users u ON u.id = w.user_id
+      WHERE u.telegram_id = $1
+      LIMIT 1
+    `, [999999999]);
+
+    if (result.rows.length === 0) {
+      res.end(JSON.stringify({
+        ok: false,
+        message: "Wallet not found"
+      }));
+      return;
+    }
+
+    const row = result.rows[0];
+    const balance = Number(row.balance);
+    const lockedBalance = Number(row.locked_balance);
+    const availableBalance = balance - lockedBalance;
+
+    res.end(JSON.stringify({
+      ok: true,
+      balance: Number(balance.toFixed(2)),
+      availableBalance: Number(availableBalance.toFixed(2)),
+      lockedBalance: Number(lockedBalance.toFixed(2)),
+      currency: row.currency
+    }));
+
+  } catch (error) {
+    console.log("WALLET STATUS DATABASE ERROR:", error.message);
+
+    res.end(JSON.stringify({
+      ok: false,
+      message: "Database error"
+    }));
+  }
 
   return;
 }
