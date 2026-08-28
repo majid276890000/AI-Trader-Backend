@@ -61,7 +61,7 @@ async function initDatabase() {
 
     console.log("DATABASE TABLES OK");
   } catch (error) {
-    console.log("DATABASE INIT ERROR:", error.message);
+    console.log("DATABASE INIT ERROR:", error);
   }
 }
 
