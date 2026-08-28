@@ -443,37 +443,86 @@ const server = http.createServer(
 
   const amount = 100;
 
-  wallet.balance += amount;
-  wallet.availableBalance += amount;
+  try {
+    const client = await pool.connect();
 
-  walletTransactions.push({
-    id: Date.now(),
-    type: "DEPOSIT",
-    amount: amount,
-    currency: wallet.currency,
-    status: "COMPLETED",
-    timestamp:
-      new Date().toISOString()
-  });
+    try {
+      await client.query("BEGIN");
 
-  res.end(JSON.stringify({
-    ok: true,
-    action: "DEPOSIT",
-    amount: amount,
-    balance:
-      Number(
-        wallet.balance.toFixed(2)
-      ),
-    availableBalance:
-      Number(
-        wallet.availableBalance.toFixed(2)
-      ),
-    lockedBalance:
-      Number(
-        wallet.lockedBalance.toFixed(2)
-      ),
-    currency: wallet.currency
-  }));
+      const walletResult = await client.query(`
+        SELECT
+          w.id,
+          w.balance,
+          w.locked_balance,
+          w.currency
+        FROM wallets w
+        JOIN users u ON u.id = w.user_id
+        WHERE u.telegram_id = $1
+        FOR UPDATE
+      `, [999999999]);
+
+      if (walletResult.rows.length === 0) {
+        await client.query("ROLLBACK");
+
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Wallet not found"
+        }));
+
+        return;
+      }
+
+      const row = walletResult.rows[0];
+      const oldBalance = Number(row.balance);
+      const newBalance = oldBalance + amount;
+
+      await client.query(`
+        UPDATE wallets
+        SET balance = $1,
+            updated_at = NOW()
+        WHERE id = $2
+      `, [newBalance, row.id]);
+
+      await client.query(`
+        INSERT INTO wallet_transactions
+          (user_id, type, amount, currency, status, description)
+        SELECT
+          u.id, 'DEPOSIT', $1, $2, 'COMPLETED', 'Test deposit'
+        FROM users u
+        WHERE u.telegram_id = $3
+      `, [amount, row.currency, 999999999]);
+
+      await client.query("COMMIT");
+
+      const lockedBalance = Number(row.locked_balance);
+
+      res.end(JSON.stringify({
+        ok: true,
+        action: "DEPOSIT",
+        amount: amount,
+        balance: Number(newBalance.toFixed(2)),
+        availableBalance: Number(
+          (newBalance - lockedBalance).toFixed(2)
+        ),
+        lockedBalance: Number(lockedBalance.toFixed(2)),
+        currency: row.currency
+      }));
+
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+
+  } catch (error) {
+    console.log("WALLET DEPOSIT DATABASE ERROR:", error.message);
+
+    res.end(JSON.stringify({
+      ok: false,
+      message: "Database error"
+    }));
+  }
 
   return;
 }
