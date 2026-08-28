@@ -703,87 +703,166 @@ if (confirmUrl.pathname === "/wallet-confirm-withdraw") {
     Number(confirmUrl.searchParams.get("id"));
 
   if (!transactionId) {
-
     res.end(JSON.stringify({
       ok: false,
-      message: "Transaction id is required",
-      currency: wallet.currency
+      message: "Transaction id is required"
     }));
-
     return;
   }
 
-  const pendingTransaction =
-    walletTransactions.find(
-      tx =>
-        tx.id === transactionId &&
-        tx.type === "WITHDRAW" &&
-        tx.status === "PENDING"
+  try {
+    const client = await pool.connect();
+
+    try {
+      await client.query("BEGIN");
+
+      const transactionResult = await client.query(`
+        SELECT
+          wt.id,
+          wt.user_id,
+          wt.amount,
+          wt.currency,
+          wt.status
+        FROM wallet_transactions wt
+        JOIN users u ON u.id = wt.user_id
+        WHERE wt.id = $1
+          AND wt.type = 'WITHDRAW'
+          AND wt.status = 'PENDING'
+          AND u.telegram_id = $2
+        FOR UPDATE
+      `, [transactionId, 999999999]);
+
+      if (transactionResult.rows.length === 0) {
+        await client.query("ROLLBACK");
+
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Pending withdrawal not found",
+          transactionId: transactionId
+        }));
+
+        return;
+      }
+
+      const transaction =
+        transactionResult.rows[0];
+
+      const amount =
+        Number(transaction.amount);
+
+      const walletResult = await client.query(`
+        SELECT
+          id,
+          balance,
+          locked_balance,
+          currency
+        FROM wallets
+        WHERE user_id = $1
+        FOR UPDATE
+      `, [transaction.user_id]);
+
+      if (walletResult.rows.length === 0) {
+        await client.query("ROLLBACK");
+
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Wallet not found",
+          transactionId: transactionId
+        }));
+
+        return;
+      }
+
+      const walletRow =
+        walletResult.rows[0];
+
+      const balance =
+        Number(walletRow.balance);
+
+      const lockedBalance =
+        Number(walletRow.locked_balance);
+
+      if (amount > lockedBalance) {
+        await client.query("ROLLBACK");
+
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Locked balance is insufficient",
+          transactionId: transactionId,
+          balance: Number(balance.toFixed(2)),
+          availableBalance:
+            Number(
+              (balance - lockedBalance).toFixed(2)
+            ),
+          lockedBalance:
+            Number(lockedBalance.toFixed(2)),
+          currency: walletRow.currency
+        }));
+
+        return;
+      }
+
+      const newBalance =
+        balance - amount;
+
+      const newLockedBalance =
+        lockedBalance - amount;
+
+      await client.query(`
+        UPDATE wallets
+        SET balance = $1,
+            locked_balance = $2,
+            updated_at = NOW()
+        WHERE id = $3
+      `, [
+        newBalance,
+        newLockedBalance,
+        walletRow.id
+      ]);
+
+      await client.query(`
+        UPDATE wallet_transactions
+        SET status = 'COMPLETED'
+        WHERE id = $1
+      `, [transactionId]);
+
+      await client.query("COMMIT");
+
+      res.end(JSON.stringify({
+        ok: true,
+        action: "WITHDRAW_CONFIRMED",
+        transactionId: transactionId,
+        amount: amount,
+        balance:
+          Number(newBalance.toFixed(2)),
+        availableBalance:
+          Number(
+            (newBalance - newLockedBalance).toFixed(2)
+          ),
+        lockedBalance:
+          Number(newLockedBalance.toFixed(2)),
+        status: "COMPLETED",
+        currency: walletRow.currency
+      }));
+
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+
+  } catch (error) {
+    console.log(
+      "WALLET CONFIRM WITHDRAW DATABASE ERROR:",
+      error.message
     );
 
-  if (!pendingTransaction) {
-
     res.end(JSON.stringify({
       ok: false,
-      message: "Pending withdrawal not found",
-      transactionId: transactionId,
-      balance:
-        Number(wallet.balance.toFixed(2)),
-      availableBalance:
-        Number(wallet.availableBalance.toFixed(2)),
-      lockedBalance:
-        Number(wallet.lockedBalance.toFixed(2)),
-      currency: wallet.currency
+      message: "Database error"
     }));
-
-    return;
   }
-
-  const amount =
-    Number(pendingTransaction.amount);
-
-  if (amount > wallet.lockedBalance) {
-
-    res.end(JSON.stringify({
-      ok: false,
-      message: "Locked balance is insufficient",
-      transactionId: transactionId,
-      balance:
-        Number(wallet.balance.toFixed(2)),
-      availableBalance:
-        Number(wallet.availableBalance.toFixed(2)),
-      lockedBalance:
-        Number(wallet.lockedBalance.toFixed(2)),
-      currency: wallet.currency
-    }));
-
-    return;
-  }
-
-  wallet.balance -= amount;
-  wallet.lockedBalance -= amount;
-
-  pendingTransaction.status =
-    "COMPLETED";
-
-  pendingTransaction.confirmedAt =
-    new Date().toISOString();
-
-  res.end(JSON.stringify({
-    ok: true,
-    action: "WITHDRAW_CONFIRMED",
-    transactionId: transactionId,
-    amount: amount,
-    balance:
-      Number(wallet.balance.toFixed(2)),
-    availableBalance:
-      Number(wallet.availableBalance.toFixed(2)),
-    lockedBalance:
-      Number(wallet.lockedBalance.toFixed(2)),
-    status:
-      pendingTransaction.status,
-    currency: wallet.currency
-  }));
 
   return;
 }
