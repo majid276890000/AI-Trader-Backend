@@ -489,9 +489,15 @@ const server = http.createServer(
     // =========================
     // WALLET DEPOSIT - TEST
     // =========================
-    if (req.url === "/wallet-deposit") {
+    const depositUrl = new URL(req.url, "http://localhost");
+    if (depositUrl.pathname === "/wallet-deposit") {
 
-  const amount = 100;
+  const amount = Number(depositUrl.searchParams.get("amount"));
+
+  if (Number.isFinite(amount) === false || amount <= 0) {
+    res.end(JSON.stringify({ok:false,message:"Invalid deposit amount"}));
+    return;
+  }
 
   try {
     const client = await pool.connect();
