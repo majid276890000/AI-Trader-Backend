@@ -563,13 +563,6 @@ const server = http.createServer(
 
     const row = walletData.wallet;
 
-    if (result.rows.length === 0) {
-      res.end(JSON.stringify({
-        ok: false,
-        message: "Wallet not found"
-      }));
-      return;
-    }
 
     
     const balance = Number(row.balance);
