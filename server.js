@@ -67,6 +67,15 @@ async function getOrCreateTelegramWallet(telegramUser) {
     await client.query("BEGIN");
 
     const userResult = await client.query(`
+      ALTER TABLE wallets
+      ADD COLUMN IF NOT EXISTS tron_address TEXT;
+
+      ALTER TABLE wallets
+      ADD COLUMN IF NOT EXISTS tron_network VARCHAR(20) DEFAULT 'TRC20';
+
+      ALTER TABLE wallets
+      ADD COLUMN IF NOT EXISTS deposit_enabled BOOLEAN DEFAULT FALSE;
+
       INSERT INTO users (telegram_id)
       VALUES ($1)
       ON CONFLICT (telegram_id)
