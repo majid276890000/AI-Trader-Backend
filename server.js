@@ -715,9 +715,19 @@ const server = http.createServer(
     // =========================
     // WALLET WITHDRAW - TEST
     // =========================
-    if (req.url === "/wallet-withdraw") {
+    const withdrawUrl = new URL(req.url, "http://localhost");
 
-  const amount = 20;
+    if (withdrawUrl.pathname === "/wallet-withdraw") {
+
+  const amount = Number(withdrawUrl.searchParams.get("amount"));
+  
+  if (!Number.isFinite(amount) || amount <= 0) {
+    res.end(JSON.stringify({
+      ok: false,
+      message: "Invalid withdrawal amount"
+    }));
+    return;
+  }
 
   try {
     const client = await pool.connect();
