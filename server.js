@@ -356,7 +356,7 @@ const server = http.createServer(
 
     res.setHeader(
       "Access-Control-Allow-Headers",
-      "Content-Type"
+      "Content-Type, X-Telegram-Init-Data"
     );
 
     res.writeHead(200, {
