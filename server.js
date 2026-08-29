@@ -35,7 +35,9 @@ function validateTelegramInitData(initData) {
     const user = params.get("user");
     if (!user) return null;
 
-    return JSON.parse(user);
+    const telegramUser = JSON.parse(user);
+    console.log("TELEGRAM AUTH OK ID:", telegramUser.id);
+    return telegramUser;
 
   } catch (error) {
     console.log("TELEGRAM AUTH ERROR:", error.message);
