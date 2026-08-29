@@ -870,6 +870,18 @@ const server = http.createServer(
     if (req.url === "/wallet-transactions") {
 
       try {
+
+        const telegramUser = getTelegramUserFromRequest(req);
+
+        if (!telegramUser) {
+          res.end(JSON.stringify({
+            ok: false,
+            message: "Telegram authentication required",
+            transactions: []
+          }));
+          return;
+        }
+
         const result = await pool.query(`
           SELECT
             wt.id,
@@ -883,7 +895,7 @@ const server = http.createServer(
           JOIN users u ON u.id = wt.user_id
           WHERE u.telegram_id = $1
           ORDER BY wt.created_at DESC
-        `, [999999999]);
+        `, [String(telegramUser.id)]);
 
         res.end(JSON.stringify({
           ok: true,
