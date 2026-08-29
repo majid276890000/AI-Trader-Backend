@@ -1,6 +1,101 @@
 const http = require("http");
+const BOT_TOKEN = process.env.BOT_TOKEN;
 const crypto = require("crypto");
 const { Pool } = require("pg");
+
+
+function validateTelegramInitData(initData) {
+  if (!BOT_TOKEN || !initData) return null;
+
+  try {
+    const params = new URLSearchParams(initData);
+    const hash = params.get("hash");
+
+    if (!hash) return null;
+
+    params.delete("hash");
+
+    const dataCheckString = [...params.entries()]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, value]) => `${key}=${value}`)
+      .join("\n");
+
+    const secretKey = crypto
+      .createHmac("sha256", "WebAppData")
+      .update(BOT_TOKEN)
+      .digest();
+
+    const calculatedHash = crypto
+      .createHmac("sha256", secretKey)
+      .update(dataCheckString)
+      .digest("hex");
+
+    if (calculatedHash !== hash) return null;
+
+    const user = params.get("user");
+    if (!user) return null;
+
+    return JSON.parse(user);
+
+  } catch (error) {
+    console.log("TELEGRAM AUTH ERROR:", error.message);
+    return null;
+  }
+}
+
+
+function getTelegramUserFromRequest(req) {
+  const initData = req.headers["x-telegram-init-data"];
+
+  if (!initData) return null;
+
+  return validateTelegramInitData(initData);
+}
+
+
+async function getOrCreateTelegramWallet(telegramUser) {
+  if (!telegramUser || !telegramUser.id) {
+    return null;
+  }
+
+  const telegramId = String(telegramUser.id);
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const userResult = await client.query(`
+      INSERT INTO users (telegram_id)
+      VALUES ($1)
+      ON CONFLICT (telegram_id)
+      DO UPDATE SET telegram_id = EXCLUDED.telegram_id
+      RETURNING id, telegram_id
+    `, [telegramId]);
+
+    const user = userResult.rows[0];
+
+    const walletResult = await client.query(`
+      INSERT INTO wallets (user_id, balance, locked_balance, currency)
+      VALUES ($1, 0, 0, 'USDT')
+      ON CONFLICT (user_id)
+      DO UPDATE SET user_id = EXCLUDED.user_id
+      RETURNING id, user_id, balance, locked_balance, currency
+    `, [user.id]);
+
+    await client.query("COMMIT");
+
+    return {
+      user,
+      wallet: walletResult.rows[0]
+    };
+
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -441,17 +536,29 @@ const server = http.createServer(
     // =========================
     if (req.url === "/wallet-status") {
 
+  const telegramUser = getTelegramUserFromRequest(req);
+
+  if (!telegramUser) {
+    res.end(JSON.stringify({
+      ok: false,
+      message: "Telegram authentication required"
+    }));
+    return;
+  }
+
   try {
-    const result = await pool.query(`
-      SELECT
-        w.balance,
-        w.locked_balance,
-        w.currency
-      FROM wallets w
-      JOIN users u ON u.id = w.user_id
-      WHERE u.telegram_id = $1
-      LIMIT 1
-    `, [999999999]);
+    const walletData =
+      await getOrCreateTelegramWallet(telegramUser);
+
+    if (!walletData) {
+      res.end(JSON.stringify({
+        ok: false,
+        message: "Telegram user not found"
+      }));
+      return;
+    }
+
+    const row = walletData.wallet;
 
     if (result.rows.length === 0) {
       res.end(JSON.stringify({
@@ -461,7 +568,7 @@ const server = http.createServer(
       return;
     }
 
-    const row = result.rows[0];
+    
     const balance = Number(row.balance);
     const lockedBalance = Number(row.locked_balance);
     const availableBalance = balance - lockedBalance;
@@ -505,6 +612,33 @@ const server = http.createServer(
     try {
       await client.query("BEGIN");
 
+      const telegramUser = getTelegramUserFromRequest(req);
+
+      if (!telegramUser) {
+        await client.query("ROLLBACK");
+
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Telegram authentication required"
+        }));
+
+        return;
+      }
+
+      const walletData =
+        await getOrCreateTelegramWallet(telegramUser);
+
+      if (!walletData) {
+        await client.query("ROLLBACK");
+
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Telegram wallet could not be created"
+        }));
+
+        return;
+      }
+
       const walletResult = await client.query(`
         SELECT
           w.id,
@@ -512,10 +646,9 @@ const server = http.createServer(
           w.locked_balance,
           w.currency
         FROM wallets w
-        JOIN users u ON u.id = w.user_id
-        WHERE u.telegram_id = $1
+        WHERE w.user_id = $1
         FOR UPDATE
-      `, [999999999]);
+      `, [walletData.user.id]);
 
       if (walletResult.rows.length === 0) {
         await client.query("ROLLBACK");
@@ -596,6 +729,33 @@ const server = http.createServer(
     try {
       await client.query("BEGIN");
 
+      const telegramUser = getTelegramUserFromRequest(req);
+
+      if (!telegramUser) {
+        await client.query("ROLLBACK");
+
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Telegram authentication required"
+        }));
+
+        return;
+      }
+
+      const walletData =
+        await getOrCreateTelegramWallet(telegramUser);
+
+      if (!walletData) {
+        await client.query("ROLLBACK");
+
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Telegram wallet could not be created"
+        }));
+
+        return;
+      }
+
       const walletResult = await client.query(`
         SELECT
           w.id,
@@ -604,10 +764,9 @@ const server = http.createServer(
           w.locked_balance,
           w.currency
         FROM wallets w
-        JOIN users u ON u.id = w.user_id
-        WHERE u.telegram_id = $1
+        WHERE w.user_id = $1
         FOR UPDATE
-      `, [999999999]);
+      `, [walletData.user.id]);
 
       if (walletResult.rows.length === 0) {
         await client.query("ROLLBACK");
@@ -772,6 +931,33 @@ if (confirmUrl.pathname === "/wallet-confirm-withdraw") {
     try {
       await client.query("BEGIN");
 
+      const telegramUser = getTelegramUserFromRequest(req);
+
+      if (!telegramUser) {
+        await client.query("ROLLBACK");
+
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Telegram authentication required"
+        }));
+
+        return;
+      }
+
+      const walletData =
+        await getOrCreateTelegramWallet(telegramUser);
+
+      if (!walletData) {
+        await client.query("ROLLBACK");
+
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Telegram wallet could not be created"
+        }));
+
+        return;
+      }
+
       const transactionResult = await client.query(`
         SELECT
           wt.id,
@@ -780,13 +966,12 @@ if (confirmUrl.pathname === "/wallet-confirm-withdraw") {
           wt.currency,
           wt.status
         FROM wallet_transactions wt
-        JOIN users u ON u.id = wt.user_id
         WHERE wt.id = $1
+          AND wt.user_id = $2
           AND wt.type = 'WITHDRAW'
           AND wt.status = 'PENDING'
-          AND u.telegram_id = $2
         FOR UPDATE
-      `, [transactionId, 999999999]);
+      `, [transactionId, walletData.user.id]);
 
       if (transactionResult.rows.length === 0) {
         await client.query("ROLLBACK");
