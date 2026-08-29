@@ -537,6 +537,7 @@ const server = http.createServer(
     // WALLET STATUS
     // =========================
     if (req.url === "/wallet-status") {
+      console.log("WALLET STATUS REQUEST RECEIVED");
 
   const telegramUser = getTelegramUserFromRequest(req);
 
