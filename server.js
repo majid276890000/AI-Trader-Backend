@@ -1485,6 +1485,81 @@ if (confirmUrl.pathname === "/wallet-confirm-withdraw") {
     }
 
     // =========================
+    // TRADE HISTORY
+    // =========================
+    if (req.url.startsWith("/trade-history")) {
+
+      const telegramUser =
+        getTelegramUserFromRequest(req);
+
+      if (!telegramUser) {
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Telegram authentication required",
+          trades: []
+        }));
+        return;
+      }
+
+      let client;
+
+      try {
+
+        client = await pool.connect();
+
+        const telegramId =
+          String(telegramUser.id);
+
+        const result =
+          await client.query(`
+            SELECT
+              t.id,
+              t.symbol,
+              t.side,
+              t.price,
+              t.quantity,
+              t.amount,
+              t.profit,
+              t.status,
+              t.created_at,
+              t.closed_at
+            FROM trades t
+            JOIN users u
+              ON u.id = t.user_id
+            WHERE u.telegram_id = $1
+            ORDER BY t.id DESC
+            LIMIT 50
+          `, [telegramId]);
+
+        res.end(JSON.stringify({
+          ok: true,
+          trades: result.rows
+        }));
+
+      } catch (error) {
+
+        console.log(
+          "TRADE HISTORY DATABASE ERROR:",
+          error.message
+        );
+
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Trade history database error",
+          trades: []
+        }));
+
+      } finally {
+
+        if (client) {
+          client.release();
+        }
+      }
+
+      return;
+    }
+
+    // =========================
     // TRADE SELL
     // =========================
     if (req.url.startsWith("/trade-sell")) {
