@@ -1485,6 +1485,272 @@ if (confirmUrl.pathname === "/wallet-confirm-withdraw") {
     }
 
     // =========================
+    // TRADE SELL
+    // =========================
+    if (req.url.startsWith("/trade-sell")) {
+
+      const telegramUser =
+        getTelegramUserFromRequest(req);
+
+      if (!telegramUser) {
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Telegram authentication required"
+        }));
+        return;
+      }
+
+      let client;
+
+      try {
+
+        client = await pool.connect();
+
+        const telegramId =
+          String(telegramUser.id);
+
+        const userResult =
+          await client.query(`
+            SELECT id
+            FROM users
+            WHERE telegram_id = $1
+          `, [telegramId]);
+
+        if (userResult.rows.length === 0) {
+          res.end(JSON.stringify({
+            ok: false,
+            message: "Telegram user not found"
+          }));
+          return;
+        }
+
+        const userId =
+          userResult.rows[0].id;
+
+        await client.query("BEGIN");
+
+        const tradeResult =
+          await client.query(`
+            SELECT
+              id,
+              user_id,
+              symbol,
+              side,
+              price,
+              quantity,
+              amount,
+              profit,
+              status
+            FROM trades
+            WHERE user_id = $1
+              AND side = 'BUY'
+              AND status = 'OPEN'
+            ORDER BY id DESC
+            LIMIT 1
+            FOR UPDATE
+          `, [userId]);
+
+        if (tradeResult.rows.length === 0) {
+
+          await client.query("ROLLBACK");
+
+          res.end(JSON.stringify({
+            ok: false,
+            message: "No open trade found"
+          }));
+
+          return;
+        }
+
+        const trade =
+          tradeResult.rows[0];
+
+        const sellPrice =
+          await getBTCPrice();
+
+        if (
+          !Number.isFinite(sellPrice) ||
+          sellPrice <= 0
+        ) {
+          await client.query("ROLLBACK");
+
+          res.end(JSON.stringify({
+            ok: false,
+            message: "Invalid BTC price"
+          }));
+
+          return;
+        }
+
+        const quantity =
+          Number(trade.quantity);
+
+        const buyAmount =
+          Number(trade.amount);
+
+        const sellValue =
+          quantity * sellPrice;
+
+        const profit =
+          sellValue - buyAmount;
+
+        const walletResult =
+          await client.query(`
+            SELECT
+              id,
+              balance,
+              locked_balance,
+              currency
+            FROM wallets
+            WHERE user_id = $1
+            FOR UPDATE
+          `, [userId]);
+
+        if (walletResult.rows.length === 0) {
+
+          await client.query("ROLLBACK");
+
+          res.end(JSON.stringify({
+            ok: false,
+            message: "Wallet not found"
+          }));
+
+          return;
+        }
+
+        const wallet =
+          walletResult.rows[0];
+
+        const balance =
+          Number(wallet.balance);
+
+        const lockedBalance =
+          Number(wallet.locked_balance);
+
+        const newLockedBalance =
+          Math.max(
+            0,
+            lockedBalance - buyAmount
+          );
+
+        const newBalance =
+          balance + sellValue;
+
+        await client.query(`
+          UPDATE wallets
+          SET balance = $1,
+              locked_balance = $2,
+              updated_at = NOW()
+          WHERE id = $3
+        `, [
+          newBalance,
+          newLockedBalance,
+          wallet.id
+        ]);
+
+        const closedTradeResult =
+          await client.query(`
+            UPDATE trades
+            SET profit = $1,
+                status = 'CLOSED',
+                closed_at = NOW()
+            WHERE id = $2
+            RETURNING
+              id,
+              symbol,
+              side,
+              price,
+              quantity,
+              amount,
+              profit,
+              status,
+              created_at,
+              closed_at
+          `, [
+            profit,
+            trade.id
+          ]);
+
+        await client.query(`
+          INSERT INTO wallet_transactions
+            (
+              user_id,
+              type,
+              amount,
+              currency,
+              status,
+              description
+            )
+          VALUES
+            (
+              $1,
+              'TRADE_SELL',
+              $2,
+              $3,
+              'COMPLETED',
+              'BTC/USDT trade sell'
+            )
+        `, [
+          userId,
+          sellValue,
+          wallet.currency
+        ]);
+
+        await client.query("COMMIT");
+
+        res.end(JSON.stringify({
+          ok: true,
+          action: "SELL",
+          trade:
+            closedTradeResult.rows[0],
+          sellPrice:
+            Number(sellPrice.toFixed(8)),
+          sellValue:
+            Number(sellValue.toFixed(2)),
+          profit:
+            Number(profit.toFixed(2)),
+          balance:
+            Number(newBalance.toFixed(2)),
+          availableBalance:
+            Number(
+              (newBalance - newLockedBalance)
+                .toFixed(2)
+            ),
+          lockedBalance:
+            Number(newLockedBalance.toFixed(2)),
+          currency:
+            wallet.currency
+        }));
+
+      } catch (error) {
+
+        if (client) {
+          try {
+            await client.query("ROLLBACK");
+          } catch (_) {}
+        }
+
+        console.log(
+          "TRADE SELL DATABASE ERROR:",
+          error.message
+        );
+
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Trade sell database error"
+        }));
+
+      } finally {
+
+        if (client) {
+          client.release();
+        }
+      }
+
+      return;
+    }
+
+    // =========================
     // PAPER BUY
     // =========================
     if (req.url === "/paper-buy") {
