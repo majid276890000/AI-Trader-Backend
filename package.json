@@ -13,6 +13,7 @@
   "dependencies": {
     "dotenv": "^17.4.2",
     "node-telegram-bot-api": "^0.66.0",
-    "pg": "^8.23.0"
+    "pg": "^8.23.0",
+    "tronweb": "^6.5.0"
   }
 }

@@ -2,6 +2,7 @@ const http = require("http");
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const crypto = require("crypto");
 const { Pool } = require("pg");
+const { TronWeb } = require("tronweb");
 
 
 function validateTelegramInitData(initData) {
@@ -597,6 +598,43 @@ const server = http.createServer(
 
   return;
 }
+
+    // =========================
+    // WALLET TRON ADDRESS - TEST
+    // =========================
+    if (req.url === "/wallet-tron-address") {
+
+      const telegramUser = getTelegramUserFromRequest(req);
+
+      if (!telegramUser) {
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Telegram authentication required"
+        }));
+        return;
+      }
+
+      try {
+        const account = TronWeb.createRandom();
+
+        res.end(JSON.stringify({
+          ok: true,
+          network: process.env.TRON_NETWORK || "nile",
+          address: account.address,
+          testOnly: true
+        }));
+
+      } catch (error) {
+        console.log("TRON ADDRESS ERROR:", error.message);
+
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Could not create TRON test address"
+        }));
+      }
+
+      return;
+    }
 
     // =========================
     // WALLET DEPOSIT - TEST
