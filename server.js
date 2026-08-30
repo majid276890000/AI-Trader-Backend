@@ -396,6 +396,133 @@ const server = http.createServer(
     }
 
     // =========================
+    // AUTO TRADE CONTROL
+    // =========================
+    if (req.url.startsWith("/auto-trade")) {
+
+      const autoUrl =
+        new URL(
+          req.url,
+          `http://${req.headers.host || "localhost"}`
+        );
+
+      const action =
+        autoUrl.searchParams.get("action");
+
+      const telegramUser =
+        getTelegramUserFromRequest(req);
+
+      if (!telegramUser) {
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Telegram authentication required"
+        }));
+        return;
+      }
+
+      let client;
+
+      try {
+
+        client = await pool.connect();
+
+        const telegramId =
+          String(telegramUser.id);
+
+        const userResult =
+          await client.query(`
+            SELECT id
+            FROM users
+            WHERE telegram_id = $1
+          `, [telegramId]);
+
+        if (userResult.rows.length === 0) {
+          res.end(JSON.stringify({
+            ok: false,
+            message: "User not found"
+          }));
+          return;
+        }
+
+        const userId =
+          userResult.rows[0].id;
+
+        if (action === "on") {
+
+          await client.query(`
+            UPDATE wallets
+            SET auto_trade_enabled = TRUE,
+                updated_at = NOW()
+            WHERE user_id = $1
+          `, [userId]);
+
+        } else if (action === "off") {
+
+          await client.query(`
+            UPDATE wallets
+            SET auto_trade_enabled = FALSE,
+                updated_at = NOW()
+            WHERE user_id = $1
+          `, [userId]);
+
+        } else {
+
+          const result =
+            await client.query(`
+              SELECT auto_trade_enabled
+              FROM wallets
+              WHERE user_id = $1
+            `, [userId]);
+
+          res.end(JSON.stringify({
+            ok: true,
+            enabled:
+              result.rows.length > 0
+                ? result.rows[0].auto_trade_enabled
+                : false
+          }));
+
+          return;
+        }
+
+        const result =
+          await client.query(`
+            SELECT auto_trade_enabled
+            FROM wallets
+            WHERE user_id = $1
+          `, [userId]);
+
+        res.end(JSON.stringify({
+          ok: true,
+          enabled:
+            result.rows.length > 0
+              ? result.rows[0].auto_trade_enabled
+              : false
+        }));
+
+      } catch (error) {
+
+        console.log(
+          "AUTO TRADE DATABASE ERROR:",
+          error.message
+        );
+
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Auto trade database error"
+        }));
+
+      } finally {
+
+        if (client) {
+          client.release();
+        }
+      }
+
+      return;
+    }
+
+    // =========================
     // STATUS
     // =========================
     if (req.url === "/status") {
