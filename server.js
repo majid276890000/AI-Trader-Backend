@@ -155,6 +155,20 @@ async function initDatabase() {
         created_at TIMESTAMP DEFAULT NOW()
       );
 
+      CREATE TABLE IF NOT EXISTS trades (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id),
+        symbol VARCHAR(20) NOT NULL DEFAULT 'BTC/USDT',
+        side VARCHAR(10) NOT NULL,
+        price NUMERIC(20,8) NOT NULL,
+        quantity NUMERIC(20,8) NOT NULL,
+        amount NUMERIC(20,8) NOT NULL,
+        profit NUMERIC(20,8) DEFAULT 0,
+        status VARCHAR(20) NOT NULL DEFAULT 'OPEN',
+        created_at TIMESTAMP DEFAULT NOW(),
+        closed_at TIMESTAMP
+      );
+
       INSERT INTO users (telegram_id)
       VALUES (999999999)
       ON CONFLICT (telegram_id) DO NOTHING;
@@ -600,10 +614,10 @@ const server = http.createServer(
 }
 
     // =========================
-    // WALLET TRON ADDRESS - TEST
+    // =========================
+    // WALLET TRON ADDRESS
     // =========================
     if (req.url === "/wallet-tron-address") {
-
       const telegramUser = getTelegramUserFromRequest(req);
 
       if (!telegramUser) {
@@ -615,12 +629,36 @@ const server = http.createServer(
       }
 
       try {
+        const result = await getOrCreateTelegramWallet(telegramUser);
+        const wallet = result.wallet;
+
+        if (wallet.tron_address) {
+          res.end(JSON.stringify({
+            ok: true,
+            network: wallet.tron_network || "TRC20",
+            address: wallet.tron_address,
+            testOnly: true
+          }));
+          return;
+        }
+
         const account = TronWeb.createRandom();
+
+        const updated = await pool.query(
+          `UPDATE wallets
+           SET tron_address = $1,
+               tron_network = 'TRC20',
+               deposit_enabled = true,
+               updated_at = NOW()
+           WHERE id = $2
+           RETURNING tron_address, tron_network, deposit_enabled`,
+          [account.address, wallet.id]
+        );
 
         res.end(JSON.stringify({
           ok: true,
-          network: process.env.TRON_NETWORK || "nile",
-          address: account.address,
+          network: updated.rows[0].tron_network,
+          address: updated.rows[0].tron_address,
           testOnly: true
         }));
 
@@ -629,14 +667,13 @@ const server = http.createServer(
 
         res.end(JSON.stringify({
           ok: false,
-          message: "Could not create TRON test address"
+          message: "Could not create or save TRON address"
         }));
       }
 
       return;
     }
 
-    // =========================
     // WALLET DEPOSIT - TEST
     // =========================
     const depositUrl = new URL(req.url, "http://localhost");
@@ -1172,6 +1209,280 @@ if (confirmUrl.pathname === "/wallet-confirm-withdraw") {
 
   return;
 }
+
+    // =========================
+    // TRADE BUY
+    // =========================
+    if (req.url.startsWith("/trade-buy")) {
+
+      const tradeUrl = new URL(
+        req.url,
+        `http://${req.headers.host || "localhost"}`
+      );
+
+      const amount = Number(
+        tradeUrl.searchParams.get("amount")
+      );
+
+      if (!Number.isFinite(amount) || amount <= 0) {
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Invalid trade amount"
+        }));
+        return;
+      }
+
+      const telegramUser =
+        getTelegramUserFromRequest(req);
+
+      if (!telegramUser) {
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Telegram authentication required"
+        }));
+        return;
+      }
+
+      let client;
+
+      try {
+
+        // Find/create the Telegram user BEFORE
+        // opening the trade transaction.
+        const telegramId =
+          String(telegramUser.id);
+
+        client = await pool.connect();
+
+        const userResult =
+          await client.query(`
+            INSERT INTO users (telegram_id)
+            VALUES ($1)
+            ON CONFLICT (telegram_id)
+            DO UPDATE SET telegram_id = EXCLUDED.telegram_id
+            RETURNING id, telegram_id
+          `, [telegramId]);
+
+        const user =
+          userResult.rows[0];
+
+        // Ensure wallet exists.
+        await client.query(`
+          INSERT INTO wallets
+            (user_id, balance, locked_balance, currency)
+          VALUES
+            ($1, 0, 0, 'USDT')
+          ON CONFLICT (user_id)
+          DO NOTHING
+        `, [user.id]);
+
+        await client.query("BEGIN");
+
+        // Lock this user's wallet for the entire trade.
+        const walletResult =
+          await client.query(`
+            SELECT
+              id,
+              user_id,
+              balance,
+              locked_balance,
+              currency
+            FROM wallets
+            WHERE user_id = $1
+            FOR UPDATE
+          `, [user.id]);
+
+        if (walletResult.rows.length === 0) {
+          await client.query("ROLLBACK");
+
+          res.end(JSON.stringify({
+            ok: false,
+            message: "Wallet not found"
+          }));
+
+          return;
+        }
+
+        const wallet =
+          walletResult.rows[0];
+
+        const balance =
+          Number(wallet.balance);
+
+        const lockedBalance =
+          Number(wallet.locked_balance);
+
+        const availableBalance =
+          balance - lockedBalance;
+
+        if (amount > availableBalance) {
+          await client.query("ROLLBACK");
+
+          res.end(JSON.stringify({
+            ok: false,
+            message: "Insufficient available wallet balance",
+            balance:
+              Number(balance.toFixed(2)),
+            availableBalance:
+              Number(availableBalance.toFixed(2)),
+            lockedBalance:
+              Number(lockedBalance.toFixed(2)),
+            currency:
+              wallet.currency
+          }));
+
+          return;
+        }
+
+        const price =
+          await getBTCPrice();
+
+        if (
+          !Number.isFinite(price) ||
+          price <= 0
+        ) {
+          await client.query("ROLLBACK");
+
+          res.end(JSON.stringify({
+            ok: false,
+            message: "Invalid BTC price"
+          }));
+
+          return;
+        }
+
+        const quantity =
+          amount / price;
+
+        const newLockedBalance =
+          lockedBalance + amount;
+
+        await client.query(`
+          UPDATE wallets
+          SET
+            locked_balance = $1,
+            updated_at = NOW()
+          WHERE id = $2
+        `, [
+          newLockedBalance,
+          wallet.id
+        ]);
+
+        const tradeResult =
+          await client.query(`
+            INSERT INTO trades
+              (
+                user_id,
+                symbol,
+                side,
+                price,
+                quantity,
+                amount,
+                profit,
+                status
+              )
+            VALUES
+              (
+                $1,
+                'BTC/USDT',
+                'BUY',
+                $2,
+                $3,
+                $4,
+                0,
+                'OPEN'
+              )
+            RETURNING
+              id,
+              symbol,
+              side,
+              price,
+              quantity,
+              amount,
+              profit,
+              status,
+              created_at
+          `, [
+            wallet.user_id,
+            price,
+            quantity,
+            amount
+          ]);
+
+        await client.query(`
+          INSERT INTO wallet_transactions
+            (
+              user_id,
+              type,
+              amount,
+              currency,
+              status,
+              description
+            )
+          VALUES
+            (
+              $1,
+              'TRADE_BUY',
+              $2,
+              $3,
+              'COMPLETED',
+              'BTC/USDT trade buy'
+            )
+        `, [
+          wallet.user_id,
+          amount,
+          wallet.currency
+        ]);
+
+        await client.query("COMMIT");
+
+        res.end(JSON.stringify({
+          ok: true,
+          action: "BUY",
+          trade:
+            tradeResult.rows[0],
+          balance:
+            Number(balance.toFixed(2)),
+          availableBalance:
+            Number(
+              (balance - newLockedBalance)
+                .toFixed(2)
+            ),
+          lockedBalance:
+            Number(
+              newLockedBalance.toFixed(2)
+            ),
+          currency:
+            wallet.currency
+        }));
+
+      } catch (error) {
+
+        if (client) {
+          try {
+            await client.query("ROLLBACK");
+          } catch (_) {}
+        }
+
+        console.log(
+          "TRADE BUY DATABASE ERROR:",
+          error.message
+        );
+
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Trade buy database error"
+        }));
+
+      } finally {
+
+        if (client) {
+          client.release();
+        }
+      }
+
+      return;
+    }
 
     // =========================
     // PAPER BUY
