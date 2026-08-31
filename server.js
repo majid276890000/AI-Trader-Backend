@@ -365,6 +365,45 @@ async function runAutoTradeCycle() {
 }
 
 // =========================
+// Auto Trade User Check
+// =========================
+// =========================
+// Auto Trade Active Users
+// =========================
+async function getAutoTradeUsers() {
+
+  const result =
+    await pool.query(`
+      SELECT
+        u.id AS user_id,
+        u.telegram_id
+      FROM users u
+      INNER JOIN wallets w
+        ON w.user_id = u.id
+      WHERE w.auto_trade_enabled = TRUE
+    `);
+
+  return result.rows;
+}
+
+async function isAutoTradeEnabled(userId) {
+
+  const result =
+    await pool.query(`
+      SELECT auto_trade_enabled
+      FROM wallets
+      WHERE user_id = $1
+      LIMIT 1
+    `, [userId]);
+
+  if (result.rows.length === 0) {
+    return false;
+  }
+
+  return result.rows[0].auto_trade_enabled === true;
+}
+
+// =========================
 // HTTP Server
 // =========================
 
@@ -1839,7 +1878,7 @@ if (confirmUrl.pathname === "/wallet-confirm-withdraw") {
           );
 
         const newBalance =
-          balance + sellValue;
+          balance + profit;
 
         await client.query(`
           UPDATE wallets
