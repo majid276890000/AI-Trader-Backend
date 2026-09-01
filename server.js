@@ -1,3 +1,4 @@
+require("dotenv").config();
 const http = require("http");
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const crypto = require("crypto");
@@ -228,7 +229,7 @@ let priceHistory = [];
 
 let cachedBTCPrice = null;
 let cachedPriceTime = 0;
-const PRICE_CACHE_MS = 300000;
+const PRICE_CACHE_MS = 15000;
 
 // =========================
 // BTC Price
@@ -401,6 +402,430 @@ async function isAutoTradeEnabled(userId) {
   }
 
   return result.rows[0].auto_trade_enabled === true;
+}
+
+// =========================
+// User Auto Trade - DRY RUN
+// =========================
+async function runUserAutoTrade() {
+
+  try {
+
+    const users = await getAutoTradeUsers();
+
+    if (users.length === 0) {
+      console.log("AUTO TRADE: no active users");
+      return;
+    }
+
+    const analysis =
+      await getAIAnalysis();
+
+    if (
+      !analysis ||
+      !Number.isFinite(Number(analysis.price))
+    ) {
+      console.log(
+        "AUTO TRADE: invalid analysis"
+      );
+      return;
+    }
+
+    const price = Number(analysis.price);
+
+    for (const user of users) {
+
+      const openTradeResult =
+        await pool.query(`
+          SELECT id, amount, price, quantity
+          FROM trades
+          WHERE user_id = $1
+            AND side = 'BUY'
+            AND status = 'OPEN'
+          ORDER BY id DESC
+          LIMIT 1
+        `, [user.user_id]);
+
+      if (openTradeResult.rows.length > 0) {
+
+        console.log(
+          `AUTO TRADE: user=${user.user_id} has OPEN trade`
+        );
+
+        continue;
+      }
+
+      const walletResult =
+        await pool.query(`
+          SELECT balance, locked_balance, currency
+          FROM wallets
+          WHERE user_id = $1
+          LIMIT 1
+        `, [user.user_id]);
+
+      if (walletResult.rows.length === 0) {
+
+        console.log(
+          `AUTO TRADE: user=${user.user_id} wallet not found`
+        );
+
+        continue;
+      }
+
+      const wallet = walletResult.rows[0];
+
+      const balance =
+        Number(wallet.balance);
+
+      const lockedBalance =
+        Number(wallet.locked_balance);
+
+      const availableBalance =
+        balance - lockedBalance;
+
+      const tradeAmount =
+        Math.min(2, availableBalance);
+
+      if (analysis.signal === "CHECK_BUY") {
+
+        if (tradeAmount > 0) {
+
+          console.log(
+            `AUTO TRADE BUY SIGNAL: user=${user.user_id} price=${price} available=${availableBalance.toFixed(8)} amount=${tradeAmount.toFixed(2)}`
+          );
+
+          const buyResult =
+            await executeAutoTradeBuy(
+              user.user_id,
+              tradeAmount
+            );
+
+          if (buyResult.ok) {
+
+            console.log(
+              `AUTO TRADE BUY SUCCESS: user=${user.user_id} amount=${Number(buyResult.amount).toFixed(2)} price=${buyResult.price} quantity=${Number(buyResult.quantity).toFixed(8)} locked=${Number(buyResult.lockedBalance).toFixed(8)}`
+            );
+
+          } else {
+
+            console.log(
+              `AUTO TRADE BUY SKIPPED: user=${user.user_id} reason=${buyResult.message}`
+            );
+
+          }
+
+        } else {
+
+          console.log(
+            `AUTO TRADE BUY SKIPPED: user=${user.user_id} signal=CHECK_BUY available=${availableBalance.toFixed(8)} reason=INSUFFICIENT_BALANCE`
+          );
+
+        }
+
+      } else {
+
+        console.log(
+          `AUTO TRADE: user=${user.user_id} signal=${analysis.signal} trend=${analysis.trend} price=${price} available=${availableBalance.toFixed(8)} action=NO_BUY`
+        );
+
+      }
+    }
+
+  } catch (error) {
+
+    console.log(
+      "AUTO TRADE ERROR:",
+      error.message
+    );
+  }
+}
+
+// =========================
+// Auto Trade Real BUY
+// =========================
+async function executeAutoTradeBuy(userId, maxAmount = 2) {
+
+  let client;
+
+  try {
+
+    client = await pool.connect();
+
+    await client.query("BEGIN");
+
+    const walletResult =
+      await client.query(`
+        SELECT
+          id,
+          user_id,
+          balance,
+          locked_balance,
+          currency,
+          auto_trade_enabled
+        FROM wallets
+        WHERE user_id = $1
+        FOR UPDATE
+      `, [userId]);
+
+    if (walletResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return {
+        ok: false,
+        message: "Wallet not found"
+      };
+    }
+
+    const wallet = walletResult.rows[0];
+
+    if (wallet.auto_trade_enabled !== true) {
+      await client.query("ROLLBACK");
+      return {
+        ok: false,
+        message: "Auto trade disabled"
+      };
+    }
+
+    const openTradeResult =
+      await client.query(`
+        SELECT id
+        FROM trades
+        WHERE user_id = $1
+          AND side = 'BUY'
+          AND status = 'OPEN'
+        LIMIT 1
+      `, [userId]);
+
+    if (openTradeResult.rows.length > 0) {
+      await client.query("ROLLBACK");
+      return {
+        ok: false,
+        message: "Open trade already exists"
+      };
+    }
+
+    const balance = Number(wallet.balance);
+    const lockedBalance = Number(wallet.locked_balance);
+
+    const availableBalance =
+      balance - lockedBalance;
+
+    const amount =
+      Math.min(
+        Number(maxAmount),
+        availableBalance
+      );
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      await client.query("ROLLBACK");
+      return {
+        ok: false,
+        message: "Insufficient available balance"
+      };
+    }
+
+    const price = await getBTCPrice();
+
+    if (!Number.isFinite(price) || price <= 0) {
+      await client.query("ROLLBACK");
+      return {
+        ok: false,
+        message: "Invalid BTC price"
+      };
+    }
+
+    const quantity =
+      amount / price;
+
+    const newLockedBalance =
+      lockedBalance + amount;
+
+    await client.query(`
+      UPDATE wallets
+      SET
+        locked_balance = $1,
+        updated_at = NOW()
+      WHERE id = $2
+    `, [
+      newLockedBalance,
+      wallet.id
+    ]);
+
+    const tradeResult =
+      await client.query(`
+        INSERT INTO trades
+          (
+            user_id,
+            symbol,
+            side,
+            price,
+            quantity,
+            amount,
+            profit,
+            status
+          )
+        VALUES
+          (
+            $1,
+            'BTC/USDT',
+            'BUY',
+            $2,
+            $3,
+            $4,
+            0,
+            'OPEN'
+          )
+        RETURNING
+          id,
+          user_id,
+          symbol,
+          side,
+          price,
+          quantity,
+          amount,
+          profit,
+          status,
+          created_at
+      `, [
+        userId,
+        price,
+        quantity,
+        amount
+      ]);
+
+    await client.query(`
+      INSERT INTO wallet_transactions
+        (
+          user_id,
+          type,
+          amount,
+          currency,
+          status,
+          description
+        )
+      VALUES
+        (
+          $1,
+          'TRADE_BUY',
+          $2,
+          $3,
+          'COMPLETED',
+          'AI Auto Trade BUY'
+        )
+    `, [
+      userId,
+      amount,
+      wallet.currency
+    ]);
+
+    await client.query("COMMIT");
+
+    console.log(
+      `AUTO TRADE BUY: user=${userId} amount=${amount.toFixed(2)} price=${price} quantity=${quantity.toFixed(8)}`
+    );
+
+    return {
+      ok: true,
+      action: "BUY",
+      userId,
+      amount,
+      price,
+      quantity,
+      lockedBalance: newLockedBalance
+    };
+
+  } catch (error) {
+
+    if (client) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (_) {}
+    }
+
+    console.log(
+      "AUTO TRADE BUY ERROR:",
+      error.message
+    );
+
+    return {
+      ok: false,
+      message: "Auto trade buy error"
+    };
+
+  } finally {
+
+    if (client) {
+      client.release();
+    }
+  }
+}
+
+// =========================
+// Internal AI Analysis
+// =========================
+async function getAIAnalysis() {
+
+  const price = await getBTCPrice();
+
+  priceHistory.push(price);
+
+  if (priceHistory.length > 10) {
+    priceHistory.shift();
+  }
+
+  let signal = "WAIT";
+  let risk = "LOW";
+  let confidence = 60;
+  let trend = "NEUTRAL";
+
+  if (priceHistory.length >= 2) {
+
+    const firstPrice = priceHistory[0];
+
+    const changePercent =
+      ((price - firstPrice) / firstPrice) * 100;
+
+    console.log(
+      `AI SIGNAL CHECK: first=${firstPrice} current=${price} change=${changePercent.toFixed(4)}%`
+    );
+
+    if (changePercent > 0.30) {
+
+      trend = "UP";
+
+      confidence =
+        Math.min(
+          85,
+          Math.round(65 + changePercent * 10)
+        );
+
+      signal =
+        confidence >= 70
+          ? "CHECK_BUY"
+          : "WAIT";
+
+    } else if (changePercent < -0.15) {
+
+      trend = "DOWN";
+      signal = "WAIT";
+      confidence = 70;
+
+    } else {
+
+      trend = "NEUTRAL";
+      signal = "WAIT";
+      confidence = 60;
+    }
+  }
+
+  return {
+    symbol: "BTC/USDT",
+    price,
+    signal,
+    risk,
+    confidence,
+    trend,
+    samples: priceHistory.length
+  };
 }
 
 // =========================
@@ -2227,7 +2652,9 @@ if (confirmUrl.pathname === "/wallet-confirm-withdraw") {
 // Auto Trade Cycle
 // =========================
 setInterval(() => {
+  console.log("AUTO TRADE TIMER TICK");
   runAutoTradeCycle();
+  runUserAutoTrade();
 }, 15000);
 
 // =========================
