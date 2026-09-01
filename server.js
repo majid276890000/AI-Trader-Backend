@@ -191,6 +191,40 @@ async function initDatabase() {
 }
 
 initDatabase();
+// =========================
+// Read JSON Request Body
+// =========================
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+
+    let body = "";
+
+    req.on("data", chunk => {
+      body += chunk;
+
+      if (body.length > 10000) {
+        reject(new Error("Request body too large"));
+        req.destroy();
+      }
+    });
+
+    req.on("end", () => {
+      if (!body) {
+        resolve({});
+        return;
+      }
+
+      try {
+        resolve(JSON.parse(body));
+      } catch (error) {
+        reject(new Error("Invalid JSON body"));
+      }
+    });
+
+    req.on("error", reject);
+  });
+}
+
 const PORT = 3000;
 
 let botStatus = "stopped";
@@ -1656,6 +1690,313 @@ const server = http.createServer(
 
   return;
 }
+
+    // =========================
+    // WALLET FIAT WITHDRAWAL
+    // =========================
+    if (
+      req.method === "POST" &&
+      req.url === "/wallet-withdraw-fiat"
+    ) {
+
+      try {
+
+        const body = await readJsonBody(req);
+
+        const fiatAmount = Number(body.fiatAmount);
+        const accountHolder =
+          String(body.accountHolder || "").trim();
+        const iban =
+          String(body.iban || "")
+            .replace(/\s+/g, "")
+            .toUpperCase();
+
+        if (
+          !Number.isFinite(fiatAmount) ||
+          fiatAmount <= 0
+        ) {
+          res.end(JSON.stringify({
+            ok: false,
+            message: "Invalid Toman amount"
+          }));
+          return;
+        }
+
+        if (
+          accountHolder.length < 2 ||
+          accountHolder.length > 100
+        ) {
+          res.end(JSON.stringify({
+            ok: false,
+            message: "Invalid account holder"
+          }));
+          return;
+        }
+
+        if (!/^IR\d{24}$/.test(iban)) {
+          res.end(JSON.stringify({
+            ok: false,
+            message: "Invalid IBAN"
+          }));
+          return;
+        }
+
+        const telegramUser =
+          getTelegramUserFromRequest(req);
+
+        if (!telegramUser) {
+          res.end(JSON.stringify({
+            ok: false,
+            message: "Telegram authentication required"
+          }));
+          return;
+        }
+
+        // Get fresh USDT/Toman rate from the existing
+        // 2-minute validity endpoint.
+        const rateResponse = await fetch(
+          `http://127.0.0.1:${PORT}/fiat-rate`
+        );
+
+        if (!rateResponse.ok) {
+          throw new Error(
+            "Could not fetch USDT/Toman rate"
+          );
+        }
+
+        const rateData =
+          await rateResponse.json();
+
+        if (
+          !rateData.ok ||
+          !Number.isFinite(
+            Number(rateData.rateToman)
+          ) ||
+          Number(rateData.rateToman) <= 0
+        ) {
+          throw new Error(
+            rateData.message ||
+            "Invalid USDT/Toman rate"
+          );
+        }
+
+        const exchangeRate =
+          Number(rateData.rateToman);
+
+        const usdtAmount =
+          fiatAmount / exchangeRate;
+
+        if (
+          !Number.isFinite(usdtAmount) ||
+          usdtAmount <= 0
+        ) {
+          throw new Error(
+            "Invalid USDT withdrawal amount"
+          );
+        }
+
+        const client =
+          await pool.connect();
+
+        try {
+
+          await client.query("BEGIN");
+
+          const walletData =
+            await getOrCreateTelegramWallet(
+              telegramUser
+            );
+
+          if (!walletData) {
+            await client.query("ROLLBACK");
+
+            res.end(JSON.stringify({
+              ok: false,
+              message:
+                "Telegram wallet could not be created"
+            }));
+            return;
+          }
+
+          const walletResult =
+            await client.query(`
+              SELECT
+                w.id,
+                w.user_id,
+                w.balance,
+                w.locked_balance,
+                w.currency
+              FROM wallets w
+              WHERE w.user_id = $1
+              FOR UPDATE
+            `, [walletData.user.id]);
+
+          if (
+            walletResult.rows.length === 0
+          ) {
+            await client.query("ROLLBACK");
+
+            res.end(JSON.stringify({
+              ok: false,
+              message: "Wallet not found"
+            }));
+            return;
+          }
+
+          const row =
+            walletResult.rows[0];
+
+          const balance =
+            Number(row.balance);
+
+          const lockedBalance =
+            Number(row.locked_balance);
+
+          const availableBalance =
+            balance - lockedBalance;
+
+          if (
+            usdtAmount > availableBalance
+          ) {
+            await client.query("ROLLBACK");
+
+            res.end(JSON.stringify({
+              ok: false,
+              message:
+                "Insufficient available wallet balance",
+              requiredUSDT:
+                Number(usdtAmount.toFixed(8)),
+              balance:
+                Number(balance.toFixed(8)),
+              availableBalance:
+                Number(
+                  availableBalance.toFixed(8)
+                ),
+              lockedBalance:
+                Number(
+                  lockedBalance.toFixed(8)
+                ),
+              currency: row.currency
+            }));
+            return;
+          }
+
+          const newLockedBalance =
+            lockedBalance + usdtAmount;
+
+          await client.query(`
+            UPDATE wallets
+            SET locked_balance = $1,
+                updated_at = NOW()
+            WHERE id = $2
+          `, [
+            newLockedBalance,
+            row.id
+          ]);
+
+          const transactionResult =
+            await client.query(`
+              INSERT INTO wallet_transactions
+                (
+                  user_id,
+                  type,
+                  amount,
+                  currency,
+                  status,
+                  description,
+                  withdrawal_method,
+                  account_holder,
+                  iban,
+                  exchange_rate,
+                  fiat_amount
+                )
+              VALUES
+                (
+                  $1,
+                  'WITHDRAW_FIAT',
+                  $2,
+                  $3,
+                  'PENDING',
+                  'Toman withdrawal request',
+                  'FIAT',
+                  $4,
+                  $5,
+                  $6,
+                  $7
+                )
+              RETURNING
+                id,
+                created_at
+            `, [
+              row.user_id,
+              usdtAmount,
+              row.currency,
+              accountHolder,
+              iban,
+              exchangeRate,
+              fiatAmount
+            ]);
+
+          await client.query("COMMIT");
+
+          res.end(JSON.stringify({
+            ok: true,
+            action: "WITHDRAW_FIAT",
+            transactionId:
+              transactionResult.rows[0].id,
+            fiatAmount:
+              Number(fiatAmount.toFixed(0)),
+            fiatCurrency: "TOMAN",
+            usdtAmount:
+              Number(usdtAmount.toFixed(8)),
+            exchangeRate:
+              Number(exchangeRate.toFixed(2)),
+            iban,
+            accountHolder,
+            balance:
+              Number(balance.toFixed(8)),
+            availableBalance:
+              Number(
+                (
+                  balance -
+                  newLockedBalance
+                ).toFixed(8)
+              ),
+            lockedBalance:
+              Number(
+                newLockedBalance.toFixed(8)
+              ),
+            status: "PENDING",
+            currency: row.currency
+          }));
+
+        } catch (error) {
+
+          await client.query("ROLLBACK");
+          throw error;
+
+        } finally {
+
+          client.release();
+
+        }
+
+      } catch (error) {
+
+        console.log(
+          "WALLET FIAT WITHDRAW ERROR:",
+          error.message
+        );
+
+        res.end(JSON.stringify({
+          ok: false,
+          message:
+            "Fiat withdrawal request failed"
+        }));
+      }
+
+      return;
+    }
 
     // =========================
     // WALLET TRANSACTIONS
