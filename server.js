@@ -1059,7 +1059,12 @@ async function getAIAnalysis() {
 
   const price = await getBTCPrice();
 
-  priceHistory.push(price);
+  if (
+    priceHistory.length === 0 ||
+    priceHistory[priceHistory.length - 1] !== price
+  ) {
+    priceHistory.push(price);
+  }
 
   if (priceHistory.length > 10) {
     priceHistory.shift();
@@ -1506,7 +1511,12 @@ const server = http.createServer(
         const price =
           await getBTCPrice();
 
-        priceHistory.push(price);
+        if (
+          priceHistory.length === 0 ||
+          priceHistory[priceHistory.length - 1] !== price
+        ) {
+          priceHistory.push(price);
+        }
 
         if (priceHistory.length > 10) {
           priceHistory.shift();
