@@ -439,6 +439,216 @@ async function isAutoTradeEnabled(userId) {
 }
 
 // =========================
+// Auto Trade Real SELL
+// =========================
+async function executeAutoTradeSell(userId) {
+
+  let client;
+
+  try {
+
+    client = await pool.connect();
+
+    await client.query("BEGIN");
+
+    const tradeResult =
+      await client.query(`
+        SELECT
+          id,
+          symbol,
+          side,
+          price,
+          quantity,
+          amount,
+          status
+        FROM trades
+        WHERE user_id = $1
+          AND side = 'BUY'
+          AND status = 'OPEN'
+        ORDER BY id DESC
+        LIMIT 1
+        FOR UPDATE
+      `, [userId]);
+
+    if (tradeResult.rows.length === 0) {
+
+      await client.query("ROLLBACK");
+
+      return {
+        ok: false,
+        message: "No open trade found"
+      };
+    }
+
+    const trade = tradeResult.rows[0];
+
+    const sellPrice = await getBTCPrice();
+
+    if (
+      !Number.isFinite(sellPrice) ||
+      sellPrice <= 0
+    ) {
+
+      await client.query("ROLLBACK");
+
+      return {
+        ok: false,
+        message: "Invalid BTC price"
+      };
+    }
+
+    const quantity = Number(trade.quantity);
+    const buyAmount = Number(trade.amount);
+
+    const sellValue =
+      quantity * sellPrice;
+
+    const profit =
+      sellValue - buyAmount;
+
+    const walletResult =
+      await client.query(`
+        SELECT
+          id,
+          balance,
+          locked_balance,
+          currency
+        FROM wallets
+        WHERE user_id = $1
+        FOR UPDATE
+      `, [userId]);
+
+    if (walletResult.rows.length === 0) {
+
+      await client.query("ROLLBACK");
+
+      return {
+        ok: false,
+        message: "Wallet not found"
+      };
+    }
+
+    const wallet = walletResult.rows[0];
+
+    const balance = Number(wallet.balance);
+    const lockedBalance = Number(wallet.locked_balance);
+
+    const newLockedBalance =
+      Math.max(
+        0,
+        lockedBalance - buyAmount
+      );
+
+    const newBalance =
+      balance + profit;
+
+    await client.query(`
+      UPDATE wallets
+      SET
+        balance = $1,
+        locked_balance = $2,
+        updated_at = NOW()
+      WHERE id = $3
+    `, [
+      newBalance,
+      newLockedBalance,
+      wallet.id
+    ]);
+
+    const closedTradeResult =
+      await client.query(`
+        UPDATE trades
+        SET
+          profit = $1,
+          status = 'CLOSED',
+          closed_at = NOW()
+        WHERE id = $2
+        RETURNING
+          id,
+          symbol,
+          side,
+          price,
+          quantity,
+          amount,
+          profit,
+          status,
+          created_at,
+          closed_at
+      `, [
+        profit,
+        trade.id
+      ]);
+
+    await client.query(`
+      INSERT INTO wallet_transactions
+        (
+          user_id,
+          type,
+          amount,
+          currency,
+          status,
+          description
+        )
+      VALUES
+        (
+          $1,
+          'TRADE_SELL',
+          $2,
+          $3,
+          'COMPLETED',
+          'AI Auto Trade SELL'
+        )
+    `, [
+      userId,
+      sellValue,
+      wallet.currency
+    ]);
+
+    await client.query("COMMIT");
+
+    return {
+      ok: true,
+      action: "SELL",
+      trade: closedTradeResult.rows[0],
+      sellPrice,
+      sellValue,
+      profit,
+      balance: newBalance,
+      availableBalance:
+        newBalance - newLockedBalance,
+      lockedBalance:
+        newLockedBalance,
+      currency:
+        wallet.currency
+    };
+
+  } catch (error) {
+
+    if (client) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (_) {}
+    }
+
+    console.log(
+      "AUTO TRADE SELL ERROR:",
+      error.message
+    );
+
+    return {
+      ok: false,
+      message: "Auto trade sell error"
+    };
+
+  } finally {
+
+    if (client) {
+      client.release();
+    }
+  }
+}
+
+// =========================
 // User Auto Trade - DRY RUN
 // =========================
 async function runUserAutoTrade() {
@@ -482,9 +692,47 @@ async function runUserAutoTrade() {
 
       if (openTradeResult.rows.length > 0) {
 
-        console.log(
-          `AUTO TRADE: user=${user.user_id} has OPEN trade`
-        );
+        const openTrade = openTradeResult.rows[0];
+
+        const entryPrice = Number(openTrade.price);
+        const changePercent =
+          ((price - entryPrice) / entryPrice) * 100;
+
+        if (
+          changePercent >= 2 ||
+          changePercent <= -1
+        ) {
+
+          console.log(
+            `AUTO TRADE SELL SIGNAL: user=${user.user_id} entry=${entryPrice} price=${price} change=${changePercent.toFixed(4)}%`
+          );
+
+          const sellResult =
+            await executeAutoTradeSell(
+              user.user_id
+            );
+
+          if (sellResult.ok) {
+
+            console.log(
+              `AUTO TRADE SELL SUCCESS: user=${user.user_id} price=${sellResult.sellPrice} sellValue=${sellResult.sellValue} profit=${sellResult.profit} locked=${sellResult.lockedBalance}`
+            );
+
+          } else {
+
+            console.log(
+              `AUTO TRADE SELL SKIPPED: user=${user.user_id} reason=${sellResult.message}`
+            );
+
+          }
+
+        } else {
+
+          console.log(
+            `AUTO TRADE HOLD: user=${user.user_id} entry=${entryPrice} price=${price} change=${changePercent.toFixed(4)}%`
+          );
+
+        }
 
         continue;
       }
