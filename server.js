@@ -3426,7 +3426,6 @@ if (confirmUrl.pathname === "/wallet-confirm-withdraw") {
 // =========================
 setInterval(() => {
   console.log("AUTO TRADE TIMER TICK");
-  runAutoTradeCycle();
   runUserAutoTrade();
 }, 15000);
 
