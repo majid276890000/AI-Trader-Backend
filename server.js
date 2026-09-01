@@ -105,7 +105,18 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: {
     rejectUnauthorized: false
-  }
+  },
+  max: 5,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000
+});
+
+// Prevent an idle PostgreSQL connection error from crashing Node.js.
+pool.on("error", (error) => {
+  console.log(
+    "POSTGRES POOL ERROR:",
+    error.message
+  );
 });
 async function testDatabase() {
   try {
