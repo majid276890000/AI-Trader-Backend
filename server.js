@@ -1070,25 +1070,50 @@ async function getAIAnalysis() {
   let confidence = 60;
   let trend = "NEUTRAL";
 
-  if (priceHistory.length >= 2) {
+  if (priceHistory.length >= 3) {
 
     const firstPrice = priceHistory[0];
+    const previousPrice =
+      priceHistory[priceHistory.length - 2];
 
     const changePercent =
       ((price - firstPrice) / firstPrice) * 100;
 
+    const recentChangePercent =
+      ((price - previousPrice) / previousPrice) * 100;
+
+    const risingSamples =
+      priceHistory.filter(
+        (value, index) =>
+          index > 0 &&
+          value > priceHistory[index - 1]
+      ).length;
+
+    const fallingSamples =
+      priceHistory.filter(
+        (value, index) =>
+          index > 0 &&
+          value < priceHistory[index - 1]
+      ).length;
+
     console.log(
-      `AI SIGNAL CHECK: first=${firstPrice} current=${price} change=${changePercent.toFixed(4)}%`
+      `AI SIGNAL CHECK: first=${firstPrice} current=${price} change=${changePercent.toFixed(4)}% recent=${recentChangePercent.toFixed(4)}% rising=${risingSamples} falling=${fallingSamples}`
     );
 
-    if (changePercent > 0.30) {
+    if (
+      changePercent > 0.30 &&
+      risingSamples >= fallingSamples &&
+      recentChangePercent >= 0
+    ) {
 
       trend = "UP";
 
       confidence =
         Math.min(
           85,
-          Math.round(65 + changePercent * 10)
+          Math.round(
+            70 + changePercent * 8
+          )
         );
 
       signal =
@@ -1096,7 +1121,10 @@ async function getAIAnalysis() {
           ? "CHECK_BUY"
           : "WAIT";
 
-    } else if (changePercent < -0.15) {
+    } else if (
+      changePercent < -0.15 &&
+      fallingSamples > risingSamples
+    ) {
 
       trend = "DOWN";
       signal = "WAIT";
