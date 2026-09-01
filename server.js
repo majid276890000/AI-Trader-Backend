@@ -167,8 +167,12 @@ async function initDatabase() {
         currency VARCHAR(10) NOT NULL DEFAULT 'USDT',
         status VARCHAR(20) NOT NULL,
         description TEXT,
+        destination_address TEXT,
         created_at TIMESTAMP DEFAULT NOW()
       );
+
+      ALTER TABLE wallet_transactions
+      ADD COLUMN IF NOT EXISTS destination_address TEXT;
 
       CREATE TABLE IF NOT EXISTS trades (
         id SERIAL PRIMARY KEY,
@@ -1929,6 +1933,20 @@ const server = http.createServer(
         return;
       }
 
+      const destinationAddress =
+        String(withdrawUrl.searchParams.get("address") || "").trim();
+
+      if (!/^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(destinationAddress)) {
+        await client.query("ROLLBACK");
+
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Invalid TRC20 destination address"
+        }));
+
+        return;
+      }
+
       const newLockedBalance = lockedBalance + amount;
 
       await client.query(`
@@ -1940,14 +1958,15 @@ const server = http.createServer(
 
       const transactionResult = await client.query(`
         INSERT INTO wallet_transactions
-          (user_id, type, amount, currency, status, description)
+          (user_id, type, amount, currency, status, description, destination_address)
         VALUES
-          ($1, 'WITHDRAW', $2, $3, 'PENDING', 'Test withdrawal')
-        RETURNING id, created_at
+          ($1, 'WITHDRAW', $2, $3, 'PENDING', 'USDT TRC20 withdrawal request', $4)
+        RETURNING id, created_at, destination_address
       `, [
         row.user_id,
         amount,
-        row.currency
+        row.currency,
+        destinationAddress
       ]);
 
       await client.query("COMMIT");
@@ -1957,6 +1976,7 @@ const server = http.createServer(
         action: "WITHDRAW",
         transactionId: transactionResult.rows[0].id,
         amount: amount,
+        destinationAddress: transactionResult.rows[0].destination_address,
         balance: Number(balance.toFixed(2)),
         availableBalance: Number(
           (balance - newLockedBalance).toFixed(2)
