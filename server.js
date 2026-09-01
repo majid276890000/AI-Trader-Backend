@@ -1036,6 +1036,121 @@ const server = http.createServer(
     }
 
     // =========================
+    // FIAT RATE - USDT/TOMAN
+    // =========================
+    if (req.url === "/fiat-rate") {
+      try {
+        const mcpResponse = await fetch(
+          "https://hub.arzbin.com/mcp",
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Accept": "application/json, text/event-stream"
+            },
+            body: JSON.stringify({
+              jsonrpc: "2.0",
+              id: 1,
+              method: "tools/call",
+              params: {
+                name: "get_latest_crypto_rates",
+                arguments: {
+                  symbols: ["USDT"]
+                }
+              }
+            })
+          }
+        );
+
+        if (!mcpResponse.ok) {
+          throw new Error(
+            "Arzbin HTTP " + mcpResponse.status
+          );
+        }
+
+        const text = await mcpResponse.text();
+
+        const match = text.match(
+          /data: ({.*})/
+        );
+
+        if (!match) {
+          throw new Error("Invalid Arzbin response");
+        }
+
+        const mcpData = JSON.parse(match[1]);
+
+        const structured =
+          mcpData?.result?.structuredContent;
+
+        const item =
+          structured?.data?.find(
+            x => x.code === "USDT"
+          );
+
+        if (!item) {
+          throw new Error("USDT rate not found");
+        }
+
+        if (item.isStale === true) {
+          res.end(JSON.stringify({
+            ok: false,
+            message: "USDT/Toman rate is stale"
+          }));
+          return;
+        }
+
+        const rate = Number(item.tomanPrice);
+
+        if (!Number.isFinite(rate) || rate <= 0) {
+          throw new Error("Invalid USDT/Toman rate");
+        }
+
+        const updatedAt = item.updatedAt
+          ? new Date(item.updatedAt)
+          : null;
+
+        const now = Date.now();
+
+        if (
+          !updatedAt ||
+          Number.isNaN(updatedAt.getTime()) ||
+          now - updatedAt.getTime() > 120000
+        ) {
+          res.end(JSON.stringify({
+            ok: false,
+            message: "USDT/Toman rate expired"
+          }));
+          return;
+        }
+
+        res.end(JSON.stringify({
+          ok: true,
+          symbol: "USDT/IRT",
+          rateToman: rate,
+          source: structured.source || "Arzbin",
+          updatedAt: item.updatedAt,
+          fetchedAt: new Date().toISOString(),
+          validForSeconds: 120,
+          canonicalUrl: item.canonicalUrl || null
+        }));
+
+      } catch (error) {
+        console.log(
+          "FIAT RATE ERROR:",
+          error.message
+        );
+
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Could not fetch USDT/Toman rate"
+        }));
+      }
+
+      return;
+    }
+
+    // =========================
     // BTC PRICE
     // =========================
     if (req.url === "/price") {
