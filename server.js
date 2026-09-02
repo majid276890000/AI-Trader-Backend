@@ -1209,10 +1209,6 @@ const server = http.createServer(
       "Content-Type, X-Telegram-Init-Data"
     );
 
-    res.writeHead(200, {
-      "Content-Type": "application/json"
-    });
-
     if (req.method === "GET" && req.url === "/wallex-balance") {
       try {
         const balance = await getWallexBalance();
