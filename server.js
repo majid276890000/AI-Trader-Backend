@@ -1,6 +1,7 @@
 require("dotenv").config();
 const http = require("http");
 const BOT_TOKEN = process.env.BOT_TOKEN;
+const WALLEX_API_KEY = process.env.WALLEX_API_KEY;
 const crypto = require("crypto");
 const { Pool } = require("pg");
 const { TronWeb } = require("tronweb");
@@ -362,7 +363,7 @@ async function runAutoTradeCycle() {
           paperEntryPrice) * 100;
 
       if (
-        changePercent >= 2 ||
+        changePercent >= 0.5 ||
         changePercent <= -1
       ) {
         const sellValue =
@@ -714,7 +715,7 @@ async function runUserAutoTrade() {
           ((price - entryPrice) / entryPrice) * 100;
 
         if (
-          changePercent >= 2 ||
+          changePercent >= 0.5 ||
           changePercent <= -1
         ) {
 
