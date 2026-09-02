@@ -1159,6 +1159,34 @@ async function getAIAnalysis() {
   };
 }
 
+
+// =========================
+// Wallex API - READ ONLY
+// =========================
+
+async function getWallexBalance() {
+  if (!WALLEX_API_KEY) {
+    throw new Error("WALLEX_API_KEY is not configured");
+  }
+
+  const response = await fetch(
+    "https://api.wallex.ir/v1/account/balances",
+    {
+      headers: {
+        "X-API-Key": WALLEX_API_KEY
+      }
+    }
+  );
+
+  const text = await response.text();
+
+  if (!response.ok) {
+    throw new Error(`Wallex API ${response.status}: ${text}`);
+  }
+
+  return JSON.parse(text);
+}
+
 // =========================
 // HTTP Server
 // =========================
@@ -1184,6 +1212,35 @@ const server = http.createServer(
     res.writeHead(200, {
       "Content-Type": "application/json"
     });
+
+    if (req.method === "GET" && req.url === "/wallex-balance") {
+      try {
+        const balance = await getWallexBalance();
+
+        res.writeHead(200, {
+          "Content-Type": "application/json; charset=utf-8"
+        });
+
+        res.end(JSON.stringify({
+          ok: true,
+          source: "wallex",
+          balance
+        }));
+
+      } catch (error) {
+        res.writeHead(500, {
+          "Content-Type": "application/json; charset=utf-8"
+        });
+
+        res.end(JSON.stringify({
+          ok: false,
+          source: "wallex",
+          error: error.message
+        }));
+      }
+
+      return;
+    }
 
     if (req.method === "OPTIONS") {
       res.end();
