@@ -1239,6 +1239,35 @@ const server = http.createServer(
       "Content-Type, X-Telegram-Init-Data"
     );
 
+    if (req.method === "GET" && req.url === "/wallex-trading-balance") {
+      try {
+        const balance = await getWallexTradingBalance();
+
+        res.writeHead(200, {
+          "Content-Type": "application/json; charset=utf-8"
+        });
+
+        res.end(JSON.stringify({
+          ok: true,
+          source: "wallex",
+          balance
+        }));
+
+      } catch (error) {
+        res.writeHead(500, {
+          "Content-Type": "application/json; charset=utf-8"
+        });
+
+        res.end(JSON.stringify({
+          ok: false,
+          source: "wallex",
+          error: error.message
+        }));
+      }
+
+      return;
+    }
+
     if (req.method === "GET" && req.url === "/wallex-balance") {
       try {
         const balance = await getWallexBalance();
