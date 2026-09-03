@@ -2,6 +2,7 @@ require("dotenv").config();
 const http = require("http");
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const WALLEX_API_KEY = process.env.WALLEX_API_KEY;
+const REAL_TRADE_ENABLED = process.env.REAL_TRADE_ENABLED === "true";
 const crypto = require("crypto");
 const { Pool } = require("pg");
 const { TronWeb } = require("tronweb");
@@ -871,6 +872,10 @@ async function runUserAutoTrade() {
 // Auto Trade Real BUY
 // =========================
 async function executeAutoTradeBuy(userId, maxAmount = 2) {
+  if (!REAL_TRADE_ENABLED) {
+    console.log("REAL TRADE DISABLED - BUY SKIPPED");
+    return { ok: false, action: "BUY_SKIPPED", message: "Real trading is disabled" };
+  }
 
   let client;
 
