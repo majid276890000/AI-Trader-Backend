@@ -58,6 +58,16 @@ function getTelegramUserFromRequest(req) {
   return validateTelegramInitData(initData);
 }
 
+function isAdminTelegramUser(telegramUser) {
+  const adminId = String(process.env.ADMIN_TELEGRAM_ID || "").trim();
+
+  if (!adminId || !telegramUser || !telegramUser.id) {
+    return false;
+  }
+
+  return String(telegramUser.id) === adminId;
+}
+
 
 async function getOrCreateTelegramWallet(telegramUser) {
   if (!telegramUser || !telegramUser.id) {
@@ -270,6 +280,7 @@ let walletTransactions = [];
 // Bot / Analysis
 // =========================
 let autoTradeRunning = false;
+let realOrderLock = false;
 
 let settings = {
   mode: "low-risk",
@@ -461,14 +472,29 @@ async function isAutoTradeEnabled(userId) {
 // Auto Trade Real SELL
 // =========================
 async function executeAutoTradeSell(userId) {
+  if (!REAL_TRADE_ENABLED) {
+    console.log("REAL TRADE DISABLED - SELL SKIPPED");
+    return {
+      ok: false,
+      action: "SELL_SKIPPED",
+      message: "Real trading is disabled"
+    };
+  }
+
+  if (realOrderLock) {
+    return {
+      ok: false,
+      action: "SELL_LOCKED",
+      message: "Another real order is currently running"
+    };
+  }
+
+  realOrderLock = true;
 
   let client;
 
   try {
-
     client = await pool.connect();
-
-    await client.query("BEGIN");
 
     const tradeResult =
       await client.query(`
@@ -479,20 +505,17 @@ async function executeAutoTradeSell(userId) {
           price,
           quantity,
           amount,
-          status
+          status,
+          wallex_order_id
         FROM trades
         WHERE user_id = $1
           AND side = 'BUY'
           AND status = 'OPEN'
         ORDER BY id DESC
         LIMIT 1
-        FOR UPDATE
       `, [userId]);
 
     if (tradeResult.rows.length === 0) {
-
-      await client.query("ROLLBACK");
-
       return {
         ok: false,
         message: "No open trade found"
@@ -501,29 +524,112 @@ async function executeAutoTradeSell(userId) {
 
     const trade = tradeResult.rows[0];
 
-    const sellPrice = await getBTCPrice();
-
-    if (
-      !Number.isFinite(sellPrice) ||
-      sellPrice <= 0
-    ) {
-
-      await client.query("ROLLBACK");
-
-      return {
-        ok: false,
-        message: "Invalid BTC price"
-      };
-    }
-
     const quantity = Number(trade.quantity);
     const buyAmount = Number(trade.amount);
 
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      return {
+        ok: false,
+        message: "Invalid BTC quantity"
+      };
+    }
+
+    // دریافت قیمت OTC فروش از Wallex
+    const otcQuote =
+      await getWallexOtcSellPrice();
+
+    const sellPrice =
+      Number(otcQuote.price);
+
+    if (!Number.isFinite(sellPrice) || sellPrice <= 0) {
+      return {
+        ok: false,
+        message: "Invalid Wallex OTC SELL price"
+      };
+    }
+
+    // بررسی موجودی واقعی BTC در Wallex قبل از SELL
+    const wallexBalance =
+      await getWallexTradingBalance();
+
+    const wallexAvailableBTC =
+      Math.max(
+        0,
+        wallexBalance.btcValue -
+        wallexBalance.btcLocked
+      );
+
+    const sellQuantity =
+      Math.min(
+        quantity,
+        wallexAvailableBTC
+      );
+
+    if (
+      !Number.isFinite(sellQuantity) ||
+      sellQuantity <= 0
+    ) {
+      return {
+        ok: false,
+        message: "Insufficient Wallex BTC balance"
+      };
+    }
+
+    // ارسال SELL واقعی به Wallex
+    const wallexResult =
+      await placeWallexOtcSell(sellQuantity);
+
+    const wallexOrder =
+      wallexResult?.result;
+
+    if (!wallexOrder) {
+      return {
+        ok: false,
+        message: "Wallex SELL response missing"
+      };
+    }
+
+    const wallexOrderId =
+      wallexOrder.clientOrderId || null;
+
+    const executedQty =
+      Number(wallexOrder.executedQty || 0);
+
+    const executedPrice =
+      Number(
+        wallexOrder.executedPrice || sellPrice
+      );
+
     const sellValue =
-      quantity * sellPrice;
+      Number(
+        wallexOrder.executedSum ||
+        (executedQty * executedPrice)
+      );
+
+    if (
+      !Number.isFinite(executedQty) ||
+      executedQty <= 0
+    ) {
+      return {
+        ok: false,
+        message: "Wallex SELL was not executed"
+      };
+    }
+
+    if (
+      !Number.isFinite(sellValue) ||
+      sellValue <= 0
+    ) {
+      return {
+        ok: false,
+        message: "Invalid Wallex SELL value"
+      };
+    }
 
     const profit =
       sellValue - buyAmount;
+
+    await client.query("BEGIN");
 
     const walletResult =
       await client.query(`
@@ -538,7 +644,6 @@ async function executeAutoTradeSell(userId) {
       `, [userId]);
 
     if (walletResult.rows.length === 0) {
-
       await client.query("ROLLBACK");
 
       return {
@@ -549,8 +654,11 @@ async function executeAutoTradeSell(userId) {
 
     const wallet = walletResult.rows[0];
 
-    const balance = Number(wallet.balance);
-    const lockedBalance = Number(wallet.locked_balance);
+    const balance =
+      Number(wallet.balance);
+
+    const lockedBalance =
+      Number(wallet.locked_balance);
 
     const newLockedBalance =
       Math.max(
@@ -560,6 +668,40 @@ async function executeAutoTradeSell(userId) {
 
     const newBalance =
       balance + profit;
+
+    const closedTradeResult =
+      await client.query(`
+        UPDATE trades
+        SET
+          price = $1,
+          quantity = $2,
+          amount = $3,
+          profit = $4,
+          status = 'CLOSED',
+          closed_at = NOW(),
+          wallex_order_id = $5
+        WHERE id = $6
+        RETURNING
+          id,
+          user_id,
+          symbol,
+          side,
+          price,
+          quantity,
+          amount,
+          profit,
+          status,
+          wallex_order_id,
+          created_at,
+          closed_at
+      `, [
+        executedPrice,
+        executedQty,
+        sellValue,
+        profit,
+        wallexOrderId,
+        trade.id
+      ]);
 
     await client.query(`
       UPDATE wallets
@@ -573,30 +715,6 @@ async function executeAutoTradeSell(userId) {
       newLockedBalance,
       wallet.id
     ]);
-
-    const closedTradeResult =
-      await client.query(`
-        UPDATE trades
-        SET
-          profit = $1,
-          status = 'CLOSED',
-          closed_at = NOW()
-        WHERE id = $2
-        RETURNING
-          id,
-          symbol,
-          side,
-          price,
-          quantity,
-          amount,
-          profit,
-          status,
-          created_at,
-          closed_at
-      `, [
-        profit,
-        trade.id
-      ]);
 
     await client.query(`
       INSERT INTO wallet_transactions
@@ -615,7 +733,7 @@ async function executeAutoTradeSell(userId) {
           $2,
           $3,
           'COMPLETED',
-          'AI Auto Trade SELL'
+          'AI Auto Trade SELL - Wallex OTC'
         )
     `, [
       userId,
@@ -625,20 +743,29 @@ async function executeAutoTradeSell(userId) {
 
     await client.query("COMMIT");
 
+    console.log(
+      `AUTO TRADE SELL WALLEX SUCCESS: user=${userId} order=${wallexOrderId} amount=${sellValue.toFixed(8)} price=${executedPrice} quantity=${executedQty.toFixed(8)} profit=${profit.toFixed(8)}`
+    );
+
     return {
       ok: true,
       action: "SELL",
-      trade: closedTradeResult.rows[0],
-      sellPrice,
+      userId,
+      wallexOrderId,
+      sellPrice: executedPrice,
       sellValue,
+      quantity: executedQty,
       profit,
+      status: wallexOrder.status,
       balance: newBalance,
       availableBalance:
         newBalance - newLockedBalance,
       lockedBalance:
         newLockedBalance,
       currency:
-        wallet.currency
+        wallet.currency,
+      trade:
+        closedTradeResult.rows[0]
     };
 
   } catch (error) {
@@ -661,429 +788,7 @@ async function executeAutoTradeSell(userId) {
 
   } finally {
 
-    if (client) {
-      client.release();
-    }
-  }
-}
-
-// =========================
-// User Auto Trade - DRY RUN
-// =========================
-async function runUserAutoTrade() {
-
-  try {
-
-    const users = await getAutoTradeUsers();
-
-    if (users.length === 0) {
-      console.log("AUTO TRADE: no active users");
-      return;
-    }
-
-    const analysis =
-      await getAIAnalysis();
-
-    if (
-      !analysis ||
-      !Number.isFinite(Number(analysis.price))
-    ) {
-      console.log(
-        "AUTO TRADE: invalid analysis"
-      );
-      return;
-    }
-
-    const price = Number(analysis.price);
-
-    for (const user of users) {
-
-      const openTradeResult =
-        await pool.query(`
-          SELECT id, amount, price, quantity
-          FROM trades
-          WHERE user_id = $1
-            AND side = 'BUY'
-            AND status = 'OPEN'
-          ORDER BY id DESC
-          LIMIT 1
-        `, [user.user_id]);
-
-      if (openTradeResult.rows.length > 0) {
-
-        const openTrade = openTradeResult.rows[0];
-
-        const entryPrice = Number(openTrade.price);
-        const changePercent =
-          ((price - entryPrice) / entryPrice) * 100;
-
-        if (
-          changePercent >= 0.5 ||
-          changePercent <= -1
-        ) {
-
-          console.log(
-            `AUTO TRADE SELL SIGNAL: user=${user.user_id} entry=${entryPrice} price=${price} change=${changePercent.toFixed(4)}%`
-          );
-
-          const sellResult =
-            await executeAutoTradeSell(
-              user.user_id
-            );
-
-          if (sellResult.ok) {
-
-            console.log(
-              `AUTO TRADE SELL SUCCESS: user=${user.user_id} price=${sellResult.sellPrice} sellValue=${sellResult.sellValue} profit=${sellResult.profit} locked=${sellResult.lockedBalance}`
-            );
-
-          } else {
-
-            console.log(
-              `AUTO TRADE SELL SKIPPED: user=${user.user_id} reason=${sellResult.message}`
-            );
-
-          }
-
-        } else {
-
-          console.log(
-            `AUTO TRADE HOLD: user=${user.user_id} entry=${entryPrice} price=${price} change=${changePercent.toFixed(4)}%`
-          );
-
-        }
-
-        continue;
-      }
-
-      const walletResult =
-        await pool.query(`
-          SELECT balance, locked_balance, currency
-          FROM wallets
-          WHERE user_id = $1
-          LIMIT 1
-        `, [user.user_id]);
-
-      if (walletResult.rows.length === 0) {
-
-        console.log(
-          `AUTO TRADE: user=${user.user_id} wallet not found`
-        );
-
-        continue;
-      }
-
-      const wallet = walletResult.rows[0];
-
-      const balance =
-        Number(wallet.balance);
-
-      const lockedBalance =
-        Number(wallet.locked_balance);
-
-      const availableBalance =
-        balance - lockedBalance;
-
-      let wallexTradingBalance = null;
-
-      try {
-        wallexTradingBalance =
-          await getWallexTradingBalance();
-
-        console.log(
-          `WALLEX BALANCE: user=${user.user_id} USDT=${wallexTradingBalance.usdtValue.toFixed(8)} locked=${wallexTradingBalance.usdtLocked.toFixed(8)} BTC=${wallexTradingBalance.btcValue.toFixed(8)} BTC_locked=${wallexTradingBalance.btcLocked.toFixed(8)}`
-        );
-
-      } catch (error) {
-
-        console.log(
-          `WALLEX BALANCE ERROR: user=${user.user_id} reason=${error.message}`
-        );
-
-      }
-
-      const wallexAvailableUSDT =
-        wallexTradingBalance
-          ? Math.max(
-              0,
-              wallexTradingBalance.usdtValue -
-              wallexTradingBalance.usdtLocked
-            )
-          : 0;
-
-      const tradeAmount =
-        Math.min(2, wallexAvailableUSDT);
-
-      if (analysis.signal === "CHECK_BUY") {
-
-        if (tradeAmount > 0) {
-
-          console.log(
-            `AUTO TRADE BUY SIGNAL: user=${user.user_id} price=${price} available=${availableBalance.toFixed(8)} amount=${tradeAmount.toFixed(2)}`
-          );
-
-          const buyResult =
-            await executeAutoTradeBuy(
-              user.user_id,
-              tradeAmount
-            );
-
-          if (buyResult.ok) {
-
-            console.log(
-              `AUTO TRADE BUY SUCCESS: user=${user.user_id} amount=${Number(buyResult.amount).toFixed(2)} price=${buyResult.price} quantity=${Number(buyResult.quantity).toFixed(8)} locked=${Number(buyResult.lockedBalance).toFixed(8)}`
-            );
-
-          } else {
-
-            console.log(
-              `AUTO TRADE BUY SKIPPED: user=${user.user_id} reason=${buyResult.message}`
-            );
-
-          }
-
-        } else {
-
-          console.log(
-            `AUTO TRADE BUY SKIPPED: user=${user.user_id} signal=CHECK_BUY available=${availableBalance.toFixed(8)} reason=INSUFFICIENT_BALANCE`
-          );
-
-        }
-
-      } else {
-
-        console.log(
-          `AUTO TRADE: user=${user.user_id} signal=${analysis.signal} trend=${analysis.trend} price=${price} available=${availableBalance.toFixed(8)} action=NO_BUY`
-        );
-
-      }
-    }
-
-  } catch (error) {
-
-    console.log(
-      "AUTO TRADE ERROR:",
-      error.message
-    );
-  }
-}
-
-// =========================
-// Auto Trade Real BUY
-// =========================
-async function executeAutoTradeBuy(userId, maxAmount = 2) {
-  if (!REAL_TRADE_ENABLED) {
-    console.log("REAL TRADE DISABLED - BUY SKIPPED");
-    return { ok: false, action: "BUY_SKIPPED", message: "Real trading is disabled" };
-  }
-
-  let client;
-
-  try {
-
-    client = await pool.connect();
-
-    await client.query("BEGIN");
-
-    const walletResult =
-      await client.query(`
-        SELECT
-          id,
-          user_id,
-          balance,
-          locked_balance,
-          currency,
-          auto_trade_enabled
-        FROM wallets
-        WHERE user_id = $1
-        FOR UPDATE
-      `, [userId]);
-
-    if (walletResult.rows.length === 0) {
-      await client.query("ROLLBACK");
-      return {
-        ok: false,
-        message: "Wallet not found"
-      };
-    }
-
-    const wallet = walletResult.rows[0];
-
-    if (wallet.auto_trade_enabled !== true) {
-      await client.query("ROLLBACK");
-      return {
-        ok: false,
-        message: "Auto trade disabled"
-      };
-    }
-
-    const openTradeResult =
-      await client.query(`
-        SELECT id
-        FROM trades
-        WHERE user_id = $1
-          AND side = 'BUY'
-          AND status = 'OPEN'
-        LIMIT 1
-      `, [userId]);
-
-    if (openTradeResult.rows.length > 0) {
-      await client.query("ROLLBACK");
-      return {
-        ok: false,
-        message: "Open trade already exists"
-      };
-    }
-
-    const balance = Number(wallet.balance);
-    const lockedBalance = Number(wallet.locked_balance);
-
-    const availableBalance =
-      balance - lockedBalance;
-
-    const amount =
-      Math.min(
-        Number(maxAmount),
-        availableBalance
-      );
-
-    if (!Number.isFinite(amount) || amount <= 0) {
-      await client.query("ROLLBACK");
-      return {
-        ok: false,
-        message: "Insufficient available balance"
-      };
-    }
-
-    const price = await getBTCPrice();
-
-    if (!Number.isFinite(price) || price <= 0) {
-      await client.query("ROLLBACK");
-      return {
-        ok: false,
-        message: "Invalid BTC price"
-      };
-    }
-
-    const quantity =
-      amount / price;
-
-    const newLockedBalance =
-      lockedBalance + amount;
-
-    await client.query(`
-      UPDATE wallets
-      SET
-        locked_balance = $1,
-        updated_at = NOW()
-      WHERE id = $2
-    `, [
-      newLockedBalance,
-      wallet.id
-    ]);
-
-    const tradeResult =
-      await client.query(`
-        INSERT INTO trades
-          (
-            user_id,
-            symbol,
-            side,
-            price,
-            quantity,
-            amount,
-            profit,
-            status
-          )
-        VALUES
-          (
-            $1,
-            'BTC/USDT',
-            'BUY',
-            $2,
-            $3,
-            $4,
-            0,
-            'OPEN'
-          )
-        RETURNING
-          id,
-          user_id,
-          symbol,
-          side,
-          price,
-          quantity,
-          amount,
-          profit,
-          status,
-          created_at
-      `, [
-        userId,
-        price,
-        quantity,
-        amount
-      ]);
-
-    await client.query(`
-      INSERT INTO wallet_transactions
-        (
-          user_id,
-          type,
-          amount,
-          currency,
-          status,
-          description
-        )
-      VALUES
-        (
-          $1,
-          'TRADE_BUY',
-          $2,
-          $3,
-          'COMPLETED',
-          'AI Auto Trade BUY'
-        )
-    `, [
-      userId,
-      amount,
-      wallet.currency
-    ]);
-
-    await client.query("COMMIT");
-
-    console.log(
-      `AUTO TRADE BUY: user=${userId} amount=${amount.toFixed(2)} price=${price} quantity=${quantity.toFixed(8)}`
-    );
-
-    return {
-      ok: true,
-      action: "BUY",
-      userId,
-      amount,
-      price,
-      quantity,
-      lockedBalance: newLockedBalance
-    };
-
-  } catch (error) {
-
-    if (client) {
-      try {
-        await client.query("ROLLBACK");
-      } catch (_) {}
-    }
-
-    console.log(
-      "AUTO TRADE BUY ERROR:",
-      error.message
-    );
-
-    return {
-      ok: false,
-      message: "Auto trade buy error"
-    };
-
-  } finally {
+    realOrderLock = false;
 
     if (client) {
       client.release();
@@ -1247,6 +952,660 @@ async function getWallexTradingBalance() {
     btcValue,
     btcLocked
   };
+}
+
+// =========================
+// Wallex OTC BUY PRICE
+// =========================
+async function getWallexOtcBuyPrice() {
+  if (!WALLEX_API_KEY) {
+    throw new Error("WALLEX_API_KEY is not configured");
+  }
+
+  const response = await fetch(
+    "https://api.wallex.ir/v1/account/otc/price?symbol=BTCUSDT&side=BUY",
+    {
+      headers: {
+        "X-API-Key": WALLEX_API_KEY
+      }
+    }
+  );
+
+  const text = await response.text();
+
+  if (!response.ok) {
+    throw new Error(
+      `Wallex OTC PRICE ${response.status}: ${text}`
+    );
+  }
+
+  const data = JSON.parse(text);
+
+  const price = Number(data?.result?.price);
+  const expiresAt = data?.result?.price_expires_at;
+
+  if (!Number.isFinite(price) || price <= 0) {
+    throw new Error("Invalid Wallex OTC BUY price");
+  }
+
+  if (!expiresAt) {
+    throw new Error("Wallex OTC BUY price expiration missing");
+  }
+
+  return {
+    price,
+    expiresAt
+  };
+}
+
+// =========================
+// Wallex OTC BUY - REAL ORDER
+// =========================
+async function placeWallexOtcBuy(amount) {
+  if (!WALLEX_API_KEY) {
+    throw new Error("WALLEX_API_KEY is not configured");
+  }
+
+  if (!Number.isFinite(amount) || amount < 2) {
+    throw new Error("Invalid OTC BUY amount: minimum is 2 USDT");
+  }
+
+  const response = await fetch(
+    "https://api.wallex.ir/v1/account/otc/orders",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-API-Key": WALLEX_API_KEY
+      },
+      body: JSON.stringify({
+        symbol: "BTCUSDT",
+        side: "BUY",
+        amount: amount.toFixed(8)
+      })
+    }
+  );
+
+  const text = await response.text();
+
+  if (!response.ok) {
+    throw new Error(`Wallex OTC BUY ${response.status}: ${text}`);
+  }
+
+  const data = JSON.parse(text);
+
+  if (!data?.success) {
+    throw new Error(
+      `Wallex OTC BUY failed: ${data?.message || "Unknown error"}`
+    );
+  }
+
+  return data;
+}
+
+// =========================
+// Auto Trade Real BUY
+// =========================
+async function executeAutoTradeBuy(userId, maxAmount) {
+  if (!REAL_TRADE_ENABLED) {
+    console.log("REAL TRADE DISABLED - BUY SKIPPED");
+    return {
+      ok: false,
+      action: "BUY_SKIPPED",
+      message: "Real trading is disabled"
+    };
+  }
+
+  if (realOrderLock) {
+    return {
+      ok: false,
+      action: "BUY_LOCKED",
+      message: "Another real order is currently running"
+    };
+  }
+
+  realOrderLock = true;
+
+  let client;
+
+  try {
+    if (!Number.isFinite(Number(maxAmount)) || Number(maxAmount) < 2) {
+      return {
+        ok: false,
+        message: "Invalid auto trade BUY amount"
+      };
+    }
+
+    // بررسی موجودی داخلی کاربر قبل از هر سفارش واقعی
+    const walletCheck = await pool.query(`
+      SELECT
+        id,
+        balance,
+        locked_balance,
+        currency
+      FROM wallets
+      WHERE user_id = $1
+      LIMIT 1
+    `, [userId]);
+
+    if (walletCheck.rows.length === 0) {
+      return {
+        ok: false,
+        message: "Wallet not found"
+      };
+    }
+
+    const internalBalance =
+      Number(walletCheck.rows[0].balance || 0);
+
+    const internalLockedBalance =
+      Number(walletCheck.rows[0].locked_balance || 0);
+
+    const internalAvailableUSDT =
+      Math.max(
+        0,
+        internalBalance - internalLockedBalance
+      );
+
+    const wallexBalance =
+      await getWallexTradingBalance();
+
+    const wallexAvailableUSDT =
+      Math.max(
+        0,
+        wallexBalance.usdtValue -
+        wallexBalance.usdtLocked
+      );
+
+    const amount = Math.min(
+      Number(maxAmount),
+      internalAvailableUSDT,
+      wallexAvailableUSDT
+    );
+
+    if (amount < 2) {
+      return {
+        ok: false,
+        message:
+          "Insufficient available USDT balance"
+      };
+    }
+
+    const otcQuote =
+      await getWallexOtcBuyPrice();
+
+    const expiresAtMs = Date.parse(otcQuote.expiresAt);
+
+    if (
+      !Number.isFinite(expiresAtMs) ||
+      expiresAtMs <= Date.now()
+    ) {
+      return {
+        ok: false,
+        message: "Wallex OTC BUY price expired"
+      };
+    }
+
+    const wallexResult = await placeWallexOtcBuy(amount);
+
+    const wallexOrder = wallexResult?.result;
+
+    if (!wallexOrder) {
+      return {
+        ok: false,
+        message: "Wallex BUY response missing"
+      };
+    }
+
+    const wallexOrderId =
+      wallexOrder.clientOrderId || null;
+
+    const executedQty =
+      Number(wallexOrder.executedQty || 0);
+
+    const executedPrice =
+      Number(
+        wallexOrder.executedPrice ||
+        otcQuote.price
+      );
+
+    const executedSum =
+      Number(
+        wallexOrder.executedSum ||
+        (executedQty * executedPrice)
+      );
+
+    if (
+      !Number.isFinite(executedQty) ||
+      executedQty <= 0
+    ) {
+      return {
+        ok: false,
+        message: "Wallex BUY was not executed",
+        wallexOrderId
+      };
+    }
+
+    if (
+      !Number.isFinite(executedSum) ||
+      executedSum <= 0
+    ) {
+      return {
+        ok: false,
+        message: "Invalid Wallex BUY value",
+        wallexOrderId
+      };
+    }
+
+    client = await pool.connect();
+
+    await client.query("BEGIN");
+
+    const walletResult = await client.query(`
+      SELECT
+        id,
+        balance,
+        locked_balance,
+        currency
+      FROM wallets
+      WHERE user_id = $1
+      FOR UPDATE
+    `, [userId]);
+
+    if (walletResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+
+      return {
+        ok: false,
+        message: "Wallet not found after Wallex BUY",
+        wallexOrderId
+      };
+    }
+
+    const wallet = walletResult.rows[0];
+
+    const balance =
+      Number(wallet.balance);
+
+    const lockedBalance =
+      Number(wallet.locked_balance);
+
+    const tradeResult = await client.query(`
+      INSERT INTO trades
+      (
+        user_id,
+        symbol,
+        side,
+        price,
+        quantity,
+        amount,
+        profit,
+        status,
+        wallex_order_id
+      )
+      VALUES
+      (
+        $1,
+        'BTC/USDT',
+        'BUY',
+        $2,
+        $3,
+        $4,
+        0,
+        'OPEN',
+        $5
+      )
+      RETURNING
+        id,
+        user_id,
+        symbol,
+        side,
+        price,
+        quantity,
+        amount,
+        profit,
+        status,
+        wallex_order_id,
+        created_at
+    `, [
+      userId,
+      executedPrice,
+      executedQty,
+      executedSum,
+      wallexOrderId
+    ]);
+
+    const newLockedBalance =
+      lockedBalance + executedSum;
+
+    await client.query(`
+      UPDATE wallets
+      SET
+        locked_balance = $1,
+        updated_at = NOW()
+      WHERE id = $2
+    `, [
+      newLockedBalance,
+      wallet.id
+    ]);
+
+    await client.query(`
+      INSERT INTO wallet_transactions
+      (
+        user_id,
+        type,
+        amount,
+        currency,
+        status,
+        description
+      )
+      VALUES
+      (
+        $1,
+        'TRADE_BUY',
+        $2,
+        $3,
+        'COMPLETED',
+        'AI Auto Trade BUY - Wallex OTC'
+      )
+    `, [
+      userId,
+      executedSum,
+      wallet.currency
+    ]);
+
+    await client.query("COMMIT");
+
+    console.log(
+      `AUTO TRADE BUY WALLEX SUCCESS: user=${userId} order=${wallexOrderId} amount=${executedSum.toFixed(8)} price=${executedPrice} quantity=${executedQty.toFixed(8)}`
+    );
+
+    return {
+      ok: true,
+      action: "BUY",
+      userId,
+      wallexOrderId,
+      buyPrice: executedPrice,
+      buyValue: executedSum,
+      quantity: executedQty,
+      status: wallexOrder.status,
+      balance,
+      availableBalance:
+        balance - newLockedBalance,
+      lockedBalance:
+        newLockedBalance,
+      currency: wallet.currency,
+      trade:
+        tradeResult.rows[0]
+    };
+
+  } catch (error) {
+
+    if (client) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (_) {}
+    }
+
+    console.log(
+      "AUTO TRADE BUY ERROR:",
+      error.message
+    );
+
+    return {
+      ok: false,
+      message: "Auto trade buy error"
+    };
+
+  } finally {
+
+    realOrderLock = false;
+
+    if (client) {
+      client.release();
+    }
+  }
+}
+
+// =========================
+// Wallex OTC SELL PRICE
+// =========================
+async function getWallexOtcSellPrice() {
+  if (!WALLEX_API_KEY) {
+    throw new Error("WALLEX_API_KEY is not configured");
+  }
+
+  const response = await fetch(
+    "https://api.wallex.ir/v1/account/otc/price?symbol=BTCUSDT&side=SELL",
+    {
+      headers: {
+        "X-API-Key": WALLEX_API_KEY
+      }
+    }
+  );
+
+  const text = await response.text();
+
+  if (!response.ok) {
+    throw new Error(
+      `Wallex OTC SELL PRICE ${response.status}: ${text}`
+    );
+  }
+
+  const data = JSON.parse(text);
+
+  const price = Number(data?.result?.price);
+  const expiresAt = data?.result?.price_expires_at;
+
+  if (!Number.isFinite(price) || price <= 0) {
+    throw new Error("Invalid Wallex OTC SELL price");
+  }
+
+  if (!expiresAt) {
+    throw new Error("Wallex OTC SELL price expiration missing");
+  }
+
+  return {
+    price,
+    expiresAt
+  };
+}
+
+// =========================
+// Wallex OTC SELL - REAL ORDER
+// =========================
+async function placeWallexOtcSell(amount) {
+  if (!WALLEX_API_KEY) {
+    throw new Error("WALLEX_API_KEY is not configured");
+  }
+
+  if (!Number.isFinite(amount) || amount <= 0) {
+    throw new Error("Invalid OTC SELL amount");
+  }
+
+  const response = await fetch(
+    "https://api.wallex.ir/v1/account/otc/orders",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-API-Key": WALLEX_API_KEY
+      },
+      body: JSON.stringify({
+        symbol: "BTCUSDT",
+        side: "SELL",
+        amount: amount.toFixed(8)
+      })
+    }
+  );
+
+  const text = await response.text();
+
+  if (!response.ok) {
+    throw new Error(
+      `Wallex OTC SELL ${response.status}: ${text}`
+    );
+  }
+
+  const data = JSON.parse(text);
+
+  if (!data?.success) {
+    throw new Error(
+      `Wallex OTC SELL failed: ${data?.message || "Unknown error"}`
+    );
+  }
+
+  return data;
+}
+
+// HTTP Server
+// =========================
+// User Auto Trade Runner
+// =========================
+async function runUserAutoTrade() {
+  try {
+    const users = await getAutoTradeUsers();
+
+    if (!users.length) {
+      return;
+    }
+
+    for (const user of users) {
+      try {
+        const enabled =
+          await isAutoTradeEnabled(user.user_id);
+
+        if (!enabled) {
+          continue;
+        }
+
+        const analysis =
+          await getAIAnalysis();
+
+        if (
+          !analysis ||
+          !Number.isFinite(Number(analysis.price))
+        ) {
+          console.log(
+            `AUTO TRADE SKIP: invalid analysis user=${user.user_id}`
+          );
+          continue;
+        }
+
+        const price =
+          Number(analysis.price);
+
+        const openTradeResult =
+          await pool.query(`
+            SELECT
+              id,
+              price,
+              quantity,
+              amount
+            FROM trades
+            WHERE user_id = $1
+              AND side = 'BUY'
+              AND status = 'OPEN'
+            ORDER BY id DESC
+            LIMIT 1
+          `, [user.user_id]);
+
+        const openTrade =
+          openTradeResult.rows[0] || null;
+
+        // =========================
+        // AUTO SELL
+        // =========================
+        if (openTrade) {
+          const buyPrice =
+            Number(openTrade.price);
+
+          if (
+            Number.isFinite(buyPrice) &&
+            buyPrice > 0
+          ) {
+            const changePercent =
+              ((price - buyPrice) / buyPrice) * 100;
+
+            console.log(
+              `AUTO TRADE CHECK: user=${user.user_id} change=${changePercent.toFixed(4)}%`
+            );
+
+            if (
+              changePercent >= 0.5 ||
+              changePercent <= -1
+            ) {
+              const sellResult =
+                await executeAutoTradeSell(
+                  user.user_id
+                );
+
+              console.log(
+                `AUTO TRADE SELL RESULT: user=${user.user_id} ok=${sellResult.ok} message=${sellResult.message || ""}`
+              );
+            }
+          }
+
+          continue;
+        }
+
+        // =========================
+        // AUTO BUY
+        // =========================
+        if (analysis.signal !== "CHECK_BUY") {
+          continue;
+        }
+
+        const wallexBalance =
+          await getWallexTradingBalance();
+
+        const wallexAvailableUSDT =
+          Math.max(
+            0,
+            wallexBalance.usdtValue -
+            wallexBalance.usdtLocked
+          );
+
+        // Maximum automatic trade size:
+        // 2 USDT for the current first live-trade stage.
+        const tradeAmount =
+          Math.min(
+            2,
+            wallexAvailableUSDT
+          );
+
+        if (tradeAmount < 2) {
+          console.log(
+            `AUTO TRADE BUY SKIP: user=${user.user_id} Wallex available USDT=${wallexAvailableUSDT.toFixed(8)}`
+          );
+          continue;
+        }
+
+        const buyResult =
+          await executeAutoTradeBuy(
+            user.user_id,
+            tradeAmount
+          );
+
+        console.log(
+          `AUTO TRADE BUY RESULT: user=${user.user_id} ok=${buyResult.ok} message=${buyResult.message || ""}`
+        );
+
+      } catch (userError) {
+
+        console.log(
+          `AUTO TRADE USER ERROR: user=${user.user_id} error=${userError.message}`
+        );
+      }
+    }
+
+  } catch (error) {
+
+    console.log(
+      "AUTO TRADE RUNNER ERROR:",
+      error.message
+    );
+  }
 }
 
 // =========================
@@ -1806,7 +2165,10 @@ const server = http.createServer(
     // =========================
     // WALLET TRON ADDRESS
     // =========================
-    if (req.url === "/wallet-tron-address") {
+    if (
+      req.method === "GET" &&
+      req.url === "/wallet-tron-address"
+    ) {
       const telegramUser = getTelegramUserFromRequest(req);
 
       if (!telegramUser) {
@@ -1821,42 +2183,116 @@ const server = http.createServer(
         const result = await getOrCreateTelegramWallet(telegramUser);
         const wallet = result.wallet;
 
-        if (wallet.tron_address) {
+        res.end(JSON.stringify({
+          ok: true,
+          network: wallet.tron_network || "TRC20",
+          address: wallet.tron_address || null,
+          addressStatus: wallet.tron_address_status || "PENDING",
+          depositEnabled: wallet.deposit_enabled === true
+        }));
+      } catch (error) {
+        console.log("TRON ADDRESS GET ERROR:", error.message);
+
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Could not load TRON wallet address"
+        }));
+      }
+
+      return;
+    }
+
+    if (
+      req.method === "POST" &&
+      req.url === "/wallet-tron-address"
+    ) {
+      const telegramUser = getTelegramUserFromRequest(req);
+
+      if (!telegramUser) {
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Telegram authentication required"
+        }));
+        return;
+      }
+
+      try {
+        const body = await readJsonBody(req);
+
+        const address = String(
+          body.address || ""
+        ).trim();
+
+        const network = String(
+          body.network || "TRC20"
+        ).trim().toUpperCase();
+
+        if (network !== "TRC20") {
           res.end(JSON.stringify({
-            ok: true,
-            network: wallet.tron_network || "TRC20",
-            address: wallet.tron_address,
-            testOnly: true
+            ok: false,
+            message: "Only TRC20 network is supported"
           }));
           return;
         }
 
-        const account = TronWeb.createRandom();
+        if (!/^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(address)) {
+          res.end(JSON.stringify({
+            ok: false,
+            message: "Invalid TRC20 wallet address"
+          }));
+          return;
+        }
+
+        const walletData =
+          await getOrCreateTelegramWallet(telegramUser);
+
+        if (!walletData) {
+          res.end(JSON.stringify({
+            ok: false,
+            message: "Telegram wallet could not be created"
+          }));
+          return;
+        }
 
         const updated = await pool.query(
           `UPDATE wallets
            SET tron_address = $1,
                tron_network = 'TRC20',
-               deposit_enabled = true,
+               tron_address_status = 'PENDING',
+               tron_address_updated_at = NOW(),
+               tron_address_approved_at = NULL,
+               tron_address_approved_by = NULL,
                updated_at = NOW()
            WHERE id = $2
-           RETURNING tron_address, tron_network, deposit_enabled`,
-          [account.address, wallet.id]
+           RETURNING
+             tron_address,
+             tron_network,
+             tron_address_status,
+             tron_address_updated_at`,
+          [
+            address,
+            walletData.wallet.id
+          ]
         );
 
         res.end(JSON.stringify({
           ok: true,
           network: updated.rows[0].tron_network,
           address: updated.rows[0].tron_address,
-          testOnly: true
+          addressStatus: updated.rows[0].tron_address_status,
+          updatedAt: updated.rows[0].tron_address_updated_at,
+          message: "TRC20 withdrawal address submitted for approval"
         }));
 
       } catch (error) {
-        console.log("TRON ADDRESS ERROR:", error.message);
+        console.log(
+          "TRON ADDRESS SAVE ERROR:",
+          error.message
+        );
 
         res.end(JSON.stringify({
           ok: false,
-          message: "Could not create or save TRON address"
+          message: "Could not save TRON wallet address"
         }));
       }
 
@@ -2041,7 +2477,10 @@ const server = http.createServer(
           w.user_id,
           w.balance,
           w.locked_balance,
-          w.currency
+          w.currency,
+          w.tron_address,
+          w.tron_network,
+          w.tron_address_status
         FROM wallets w
         WHERE w.user_id = $1
         FOR UPDATE
@@ -2080,6 +2519,43 @@ const server = http.createServer(
 
       const destinationAddress =
         String(withdrawUrl.searchParams.get("address") || "").trim();
+
+      if (row.tron_network !== "TRC20") {
+        await client.query("ROLLBACK");
+
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Only TRC20 withdrawals are supported"
+        }));
+
+        return;
+      }
+
+      if (
+        !row.tron_address ||
+        row.tron_address_status !== "APPROVED"
+      ) {
+        await client.query("ROLLBACK");
+
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Withdrawal address is not approved yet",
+          addressStatus: row.tron_address_status || "PENDING"
+        }));
+
+        return;
+      }
+
+      if (destinationAddress !== row.tron_address) {
+        await client.query("ROLLBACK");
+
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Withdrawal address does not match the approved wallet address"
+        }));
+
+        return;
+      }
 
       if (!/^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(destinationAddress)) {
         await client.query("ROLLBACK");
@@ -3547,6 +4023,190 @@ if (confirmUrl.pathname === "/wallet-confirm-withdraw") {
 
           error:
             "Could not fetch BTC price"
+        }));
+      }
+
+      return;
+    }
+
+    // =========================
+    // ADMIN TRON ADDRESS PENDING LIST
+    // =========================
+    if (
+      req.method === "GET" &&
+      req.url === "/admin/wallet-tron-pending"
+    ) {
+      const adminUser =
+        getTelegramUserFromRequest(req);
+
+      if (!adminUser) {
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Telegram authentication required"
+        }));
+        return;
+      }
+
+      if (!isAdminTelegramUser(adminUser)) {
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Admin access required"
+        }));
+        return;
+      }
+
+      try {
+        const result = await pool.query(`
+          SELECT
+            w.user_id,
+            u.telegram_id,
+            w.tron_address,
+            w.tron_network,
+            w.tron_address_status,
+            w.tron_address_updated_at
+          FROM wallets w
+          JOIN users u
+            ON u.id = w.user_id
+          WHERE w.tron_address IS NOT NULL
+            AND w.tron_network = 'TRC20'
+            AND w.tron_address_status = 'PENDING'
+          ORDER BY w.tron_address_updated_at ASC
+        `);
+
+        res.end(JSON.stringify({
+          ok: true,
+          count: result.rows.length,
+          wallets: result.rows
+        }));
+
+      } catch (error) {
+        console.log(
+          "ADMIN TRON PENDING LIST ERROR:",
+          error.message
+        );
+
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Could not load pending TRC20 addresses"
+        }));
+      }
+
+      return;
+    }
+
+    // =========================
+    // ADMIN TRON ADDRESS APPROVAL
+    // =========================
+
+    if (
+      req.method === "POST" &&
+      (
+        req.url === "/admin/wallet-tron-approve" ||
+        req.url === "/admin/wallet-tron-reject"
+      )
+    ) {
+      const adminUser =
+        getTelegramUserFromRequest(req);
+
+      if (!adminUser) {
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Telegram authentication required"
+        }));
+        return;
+      }
+
+      if (!isAdminTelegramUser(adminUser)) {
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Admin access required"
+        }));
+        return;
+      }
+
+      try {
+        const body = await readJsonBody(req);
+
+        const userId = Number(body.userId);
+
+        if (
+          !Number.isInteger(userId) ||
+          userId <= 0
+        ) {
+          res.end(JSON.stringify({
+            ok: false,
+            message: "Invalid userId"
+          }));
+          return;
+        }
+
+        const approve =
+          req.url === "/admin/wallet-tron-approve";
+
+        const status =
+          approve ? "APPROVED" : "REJECTED";
+
+        const result = await pool.query(
+          `UPDATE wallets
+           SET tron_address_status = $1,
+               tron_address_approved_at =
+                 CASE
+                   WHEN $1 = 'APPROVED' THEN NOW()
+                   ELSE NULL
+                 END,
+               tron_address_approved_by =
+                 CASE
+                   WHEN $1 = 'APPROVED' THEN $2
+                   ELSE NULL
+                 END,
+               updated_at = NOW()
+           WHERE user_id = $3
+             AND tron_address IS NOT NULL
+             AND tron_network = 'TRC20'
+           RETURNING
+             user_id,
+             tron_address,
+             tron_network,
+             tron_address_status,
+             tron_address_approved_at,
+             tron_address_approved_by`,
+          [
+            status,
+            Number(adminUser.id),
+            userId
+          ]
+        );
+
+        if (result.rows.length === 0) {
+          res.end(JSON.stringify({
+            ok: false,
+            message: "TRC20 wallet address not found"
+          }));
+          return;
+        }
+
+        const wallet = result.rows[0];
+
+        res.end(JSON.stringify({
+          ok: true,
+          action: approve ? "APPROVE" : "REJECT",
+          userId: wallet.user_id,
+          address: wallet.tron_address,
+          network: wallet.tron_network,
+          addressStatus: wallet.tron_address_status,
+          approvedAt: wallet.tron_address_approved_at,
+          approvedBy: wallet.tron_address_approved_by
+        }));
+
+      } catch (error) {
+        console.log(
+          "ADMIN TRON ADDRESS ERROR:",
+          error.message
+        );
+
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Could not update TRON address approval"
         }));
       }
 
