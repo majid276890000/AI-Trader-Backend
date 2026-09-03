@@ -1190,6 +1190,34 @@ async function getWallexBalance() {
 }
 
 // =========================
+// Wallex Trading Balance - READ ONLY
+// =========================
+
+async function getWallexTradingBalance() {
+  const data = await getWallexBalance();
+
+  const balances =
+    data?.result?.balances ||
+    {};
+
+  const usdt = balances.USDT || {};
+  const btc = balances.BTC || {};
+
+  const usdtValue = Number(usdt.value || 0);
+  const usdtLocked = Number(usdt.locked || 0);
+
+  const btcValue = Number(btc.value || 0);
+  const btcLocked = Number(btc.locked || 0);
+
+  return {
+    usdtValue,
+    usdtLocked,
+    btcValue,
+    btcLocked
+  };
+}
+
+// =========================
 // HTTP Server
 // =========================
 
