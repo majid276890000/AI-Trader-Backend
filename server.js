@@ -783,10 +783,7 @@ async function runUserAutoTrade() {
       const availableBalance =
         balance - lockedBalance;
 
-      const tradeAmount =
-        Math.min(2, availableBalance);
-
-      let wallexTradingBalance;
+      let wallexTradingBalance = null;
 
       try {
         wallexTradingBalance =
@@ -803,6 +800,18 @@ async function runUserAutoTrade() {
         );
 
       }
+
+      const wallexAvailableUSDT =
+        wallexTradingBalance
+          ? Math.max(
+              0,
+              wallexTradingBalance.usdtValue -
+              wallexTradingBalance.usdtLocked
+            )
+          : 0;
+
+      const tradeAmount =
+        Math.min(2, wallexAvailableUSDT);
 
       if (analysis.signal === "CHECK_BUY") {
 
