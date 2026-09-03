@@ -296,24 +296,26 @@ async function getBTCPrice() {
 
   try {
     const response = await fetch(
-      "https://api.coinpaprika.com/v1/tickers/btc-bitcoin"
+      "https://api.wallex.ir/v1/markets"
     );
 
     if (!response.ok) {
-      throw new Error(`CoinPaprika HTTP ${response.status}`);
+      throw new Error(`Wallex HTTP ${response.status}`);
     }
 
     const data = await response.json();
-    const price = data?.quotes?.USD?.price;
+    const price = Number(
+      data?.result?.symbols?.BTCUSDT?.stats?.lastPrice
+    );
 
-    if (typeof price !== "number") {
-      throw new Error("Invalid BTC price data");
+    if (!Number.isFinite(price) || price <= 0) {
+      throw new Error("Invalid Wallex BTC price data");
     }
 
     cachedBTCPrice = price;
     cachedPriceTime = now;
 
-    console.log("CoinPaprika BTC price:", cachedBTCPrice);
+    console.log("Wallex BTC/USDT price:", cachedBTCPrice);
 
     return cachedBTCPrice;
 
