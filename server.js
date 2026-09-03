@@ -95,7 +95,16 @@ async function getOrCreateTelegramWallet(telegramUser) {
       VALUES ($1, 0, 0, 'USDT')
       ON CONFLICT (user_id)
       DO UPDATE SET user_id = EXCLUDED.user_id
-      RETURNING id, user_id, balance, locked_balance, currency
+      RETURNING
+        id,
+        user_id,
+        balance,
+        locked_balance,
+        currency,
+        tron_address,
+        tron_network,
+        tron_address_status,
+        deposit_enabled
     `, [user.id]);
 
     await client.query("COMMIT");
