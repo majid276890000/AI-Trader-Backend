@@ -4148,19 +4148,19 @@ if (confirmUrl.pathname === "/wallet-confirm-withdraw") {
 
         const result = await pool.query(
           `UPDATE wallets
-           SET tron_address_status = $1,
+           SET tron_address_status = $1::VARCHAR,
                tron_address_approved_at =
                  CASE
-                   WHEN $1 = 'APPROVED' THEN NOW()
+                   WHEN $1::VARCHAR = 'APPROVED' THEN NOW()
                    ELSE NULL
                  END,
                tron_address_approved_by =
                  CASE
-                   WHEN $1 = 'APPROVED' THEN $2
+                   WHEN $1::VARCHAR = 'APPROVED' THEN $2::BIGINT
                    ELSE NULL
                  END,
                updated_at = NOW()
-           WHERE user_id = $3
+           WHERE user_id = $3::INTEGER
              AND tron_address IS NOT NULL
              AND tron_network = 'TRC20'
            RETURNING
