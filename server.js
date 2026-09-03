@@ -786,6 +786,24 @@ async function runUserAutoTrade() {
       const tradeAmount =
         Math.min(2, availableBalance);
 
+      let wallexTradingBalance;
+
+      try {
+        wallexTradingBalance =
+          await getWallexTradingBalance();
+
+        console.log(
+          `WALLEX BALANCE: user=${user.user_id} USDT=${wallexTradingBalance.usdtValue.toFixed(8)} locked=${wallexTradingBalance.usdtLocked.toFixed(8)} BTC=${wallexTradingBalance.btcValue.toFixed(8)} BTC_locked=${wallexTradingBalance.btcLocked.toFixed(8)}`
+        );
+
+      } catch (error) {
+
+        console.log(
+          `WALLEX BALANCE ERROR: user=${user.user_id} reason=${error.message}`
+        );
+
+      }
+
       if (analysis.signal === "CHECK_BUY") {
 
         if (tradeAmount > 0) {
