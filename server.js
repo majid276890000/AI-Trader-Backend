@@ -514,6 +514,12 @@ async function executeAutoTradeSell(userId) {
 
   let client;
 
+  let wallexOrderId = null;
+  let executedQty = 0;
+  let executedPrice = 0;
+  let sellValue = 0;
+  let wallexOrderStatus = null;
+
   try {
     client = await pool.connect();
 
@@ -610,22 +616,25 @@ async function executeAutoTradeSell(userId) {
       };
     }
 
-    const wallexOrderId =
+    wallexOrderId =
       wallexOrder.clientOrderId || null;
 
-    const executedQty =
+    executedQty =
       Number(wallexOrder.executedQty || 0);
 
-    const executedPrice =
+    executedPrice =
       Number(
         wallexOrder.executedPrice || sellPrice
       );
 
-    const sellValue =
+    sellValue =
       Number(
         wallexOrder.executedSum ||
         (executedQty * executedPrice)
       );
+
+    wallexOrderStatus =
+      wallexOrder.status || null;
 
     if (
       !Number.isFinite(executedQty) ||
@@ -700,8 +709,10 @@ async function executeAutoTradeSell(userId) {
           profit = $4,
           status = 'CLOSED',
           closed_at = NOW(),
-          wallex_order_id = $5
-        WHERE id = $6
+          wallex_order_id = $5,
+          wallex_order_status = $6,
+          reconciliation_status = 'PENDING'
+        WHERE id = $7
         RETURNING
           id,
           user_id,
@@ -721,6 +732,7 @@ async function executeAutoTradeSell(userId) {
         sellValue,
         profit,
         wallexOrderId,
+        wallexOrderStatus,
         trade.id
       ]);
 
@@ -799,8 +811,27 @@ async function executeAutoTradeSell(userId) {
 
     console.log(
       "AUTO TRADE SELL ERROR:",
-      error.message
+      error.message,
+      wallexOrderId
+        ? `order=${wallexOrderId}`
+        : ""
     );
+
+    if (wallexOrderId) {
+      return {
+        ok: false,
+        action: "SELL",
+        status: "RECONCILIATION_REQUIRED",
+        message:
+          "Wallex SELL executed but local database update failed. Manual reconciliation required.",
+        wallexOrderId,
+        wallexOrderStatus,
+        executedQty,
+        executedPrice,
+        sellValue,
+        error: error.message
+      };
+    }
 
     return {
       ok: false,
@@ -1089,6 +1120,12 @@ async function executeAutoTradeBuy(userId, maxAmount) {
 
   let client;
 
+  let wallexOrderId = null;
+  let executedQty = 0;
+  let executedPrice = 0;
+  let executedSum = 0;
+  let wallexOrderStatus = null;
+
   try {
     if (!Number.isFinite(Number(maxAmount)) || Number(maxAmount) < 2) {
       return {
@@ -1178,23 +1215,26 @@ async function executeAutoTradeBuy(userId, maxAmount) {
       };
     }
 
-    const wallexOrderId =
+    wallexOrderId =
       wallexOrder.clientOrderId || null;
 
-    const executedQty =
+    executedQty =
       Number(wallexOrder.executedQty || 0);
 
-    const executedPrice =
+    executedPrice =
       Number(
         wallexOrder.executedPrice ||
         otcQuote.price
       );
 
-    const executedSum =
+    executedSum =
       Number(
         wallexOrder.executedSum ||
         (executedQty * executedPrice)
       );
+
+    wallexOrderStatus =
+      wallexOrder.status || null;
 
     if (
       !Number.isFinite(executedQty) ||
@@ -1262,7 +1302,9 @@ async function executeAutoTradeBuy(userId, maxAmount) {
         amount,
         profit,
         status,
-        wallex_order_id
+        wallex_order_id,
+        wallex_order_status,
+        reconciliation_status
       )
       VALUES
       (
@@ -1274,7 +1316,9 @@ async function executeAutoTradeBuy(userId, maxAmount) {
         $4,
         0,
         'OPEN',
-        $5
+        $5,
+        $6,
+        'PENDING'
       )
       RETURNING
         id,
@@ -1287,13 +1331,16 @@ async function executeAutoTradeBuy(userId, maxAmount) {
         profit,
         status,
         wallex_order_id,
+        wallex_order_status,
+        reconciliation_status,
         created_at
     `, [
       userId,
       executedPrice,
       executedQty,
       executedSum,
-      wallexOrderId
+      wallexOrderId,
+      wallexOrderStatus
     ]);
 
     const newLockedBalance =
@@ -1370,8 +1417,27 @@ async function executeAutoTradeBuy(userId, maxAmount) {
 
     console.log(
       "AUTO TRADE BUY ERROR:",
-      error.message
+      error.message,
+      wallexOrderId
+        ? `order=${wallexOrderId}`
+        : ""
     );
+
+    if (wallexOrderId) {
+      return {
+        ok: false,
+        action: "BUY",
+        status: "RECONCILIATION_REQUIRED",
+        message:
+          "Wallex BUY executed but local database update failed. Manual reconciliation required.",
+        wallexOrderId,
+        wallexOrderStatus,
+        executedQty,
+        executedPrice,
+        executedSum,
+        error: error.message
+      };
+    }
 
     return {
       ok: false,
