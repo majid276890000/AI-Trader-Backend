@@ -4333,6 +4333,74 @@ if (confirmUrl.pathname === "/wallet-confirm-withdraw") {
     }
 
     // =========================
+    // ADMIN PROCESSING WITHDRAWALS
+    // =========================
+    if (
+      req.method === "GET" &&
+      req.url === "/admin/wallet-withdraw-processing"
+    ) {
+      const adminUser = getTelegramUserFromRequest(req);
+
+      if (!adminUser) {
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Telegram authentication required"
+        }));
+        return;
+      }
+
+      if (!isAdminTelegramUser(adminUser)) {
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Admin access required"
+        }));
+        return;
+      }
+
+      try {
+        const result = await pool.query(`
+          SELECT
+            wt.id,
+            wt.user_id,
+            u.telegram_id,
+            wt.amount,
+            wt.currency,
+            wt.status,
+            wt.destination_address,
+            wt.created_at,
+            wt.processed_at,
+            wt.blockchain_txid,
+            wt.error_message
+          FROM wallet_transactions wt
+          JOIN users u
+            ON u.id = wt.user_id
+          WHERE wt.type = 'WITHDRAW'
+            AND wt.status = 'PROCESSING'
+          ORDER BY wt.created_at ASC
+        `);
+
+        res.end(JSON.stringify({
+          ok: true,
+          count: result.rows.length,
+          withdrawals: result.rows
+        }));
+
+      } catch (error) {
+        console.log(
+          "ADMIN PROCESSING WITHDRAWALS ERROR:",
+          error.message
+        );
+
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Could not load processing withdrawals"
+        }));
+      }
+
+      return;
+    }
+
+    // =========================
     // DEFAULT
     // =========================
     res.end(JSON.stringify({
