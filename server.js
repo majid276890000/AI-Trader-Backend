@@ -4184,6 +4184,155 @@ if (confirmUrl.pathname === "/wallet-confirm-withdraw") {
     }
 
     // =========================
+    // ADMIN START WITHDRAWAL PROCESSING
+    // =========================
+    if (
+      req.method === "POST" &&
+      req.url === "/admin/wallet-withdraw-process"
+    ) {
+      const adminUser = getTelegramUserFromRequest(req);
+
+      if (!adminUser) {
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Telegram authentication required"
+        }));
+        return;
+      }
+
+      if (!isAdminTelegramUser(adminUser)) {
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Admin access required"
+        }));
+        return;
+      }
+
+      try {
+        const body = await readJsonBody(req);
+        const transactionId = Number(body.transactionId);
+
+        if (
+          !Number.isInteger(transactionId) ||
+          transactionId <= 0
+        ) {
+          res.end(JSON.stringify({
+            ok: false,
+            message: "Invalid transactionId"
+          }));
+          return;
+        }
+
+        const client = await pool.connect();
+
+        try {
+          await client.query("BEGIN");
+
+          const result = await client.query(`
+            SELECT
+              wt.id,
+              wt.user_id,
+              wt.amount,
+              wt.currency,
+              wt.status,
+              wt.destination_address
+            FROM wallet_transactions wt
+            WHERE wt.id = $1
+              AND wt.type = 'WITHDRAW'
+            FOR UPDATE
+          `, [transactionId]);
+
+          if (result.rows.length === 0) {
+            await client.query("ROLLBACK");
+
+            res.end(JSON.stringify({
+              ok: false,
+              message: "Withdrawal transaction not found"
+            }));
+            return;
+          }
+
+          const withdrawal = result.rows[0];
+
+          if (withdrawal.status !== "PENDING") {
+            await client.query("ROLLBACK");
+
+            res.end(JSON.stringify({
+              ok: false,
+              message: "Withdrawal is not pending",
+              status: withdrawal.status
+            }));
+            return;
+          }
+
+          const updateResult = await client.query(`
+            UPDATE wallet_transactions
+            SET
+              status = 'PROCESSING',
+              processed_at = NULL,
+              error_message = NULL
+            WHERE id = $1
+              AND type = 'WITHDRAW'
+              AND status = 'PENDING'
+            RETURNING
+              id,
+              user_id,
+              amount,
+              currency,
+              status,
+              destination_address,
+              processed_at
+          `, [transactionId]);
+
+          if (updateResult.rows.length === 0) {
+            await client.query("ROLLBACK");
+
+            res.end(JSON.stringify({
+              ok: false,
+              message: "Withdrawal could not be moved to processing"
+            }));
+            return;
+          }
+
+          await client.query("COMMIT");
+
+          const updated = updateResult.rows[0];
+
+          res.end(JSON.stringify({
+            ok: true,
+            action: "PROCESS_WITHDRAWAL",
+            transactionId: updated.id,
+            userId: updated.user_id,
+            amount: Number(updated.amount),
+            currency: updated.currency,
+            destinationAddress: updated.destination_address,
+            status: updated.status,
+            processedAt: updated.processed_at
+          }));
+
+        } catch (error) {
+          await client.query("ROLLBACK");
+          throw error;
+        } finally {
+          client.release();
+        }
+
+      } catch (error) {
+        console.log(
+          "ADMIN WITHDRAWAL PROCESS ERROR:",
+          error.message
+        );
+
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Could not process withdrawal"
+        }));
+      }
+
+      return;
+    }
+
+    // =========================
     // DEFAULT
     // =========================
     res.end(JSON.stringify({
