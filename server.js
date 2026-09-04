@@ -206,8 +206,20 @@ async function initDatabase() {
         profit NUMERIC(20,8) DEFAULT 0,
         status VARCHAR(20) NOT NULL DEFAULT 'OPEN',
         created_at TIMESTAMP DEFAULT NOW(),
-        closed_at TIMESTAMP
+        closed_at TIMESTAMP,
+        wallex_order_id TEXT,
+        wallex_order_status VARCHAR(50),
+        reconciliation_status VARCHAR(30) NOT NULL DEFAULT 'PENDING'
       );
+
+      ALTER TABLE trades
+      ADD COLUMN IF NOT EXISTS wallex_order_id TEXT;
+
+      ALTER TABLE trades
+      ADD COLUMN IF NOT EXISTS wallex_order_status VARCHAR(50);
+
+      ALTER TABLE trades
+      ADD COLUMN IF NOT EXISTS reconciliation_status VARCHAR(30) NOT NULL DEFAULT 'PENDING';
 
       INSERT INTO users (telegram_id)
       VALUES (999999999)
