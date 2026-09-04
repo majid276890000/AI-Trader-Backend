@@ -4184,6 +4184,413 @@ if (confirmUrl.pathname === "/wallet-confirm-withdraw") {
     }
 
     // =========================
+    // ADMIN COMPLETE WITHDRAWAL
+    // =========================
+    if (
+      req.method === "POST" &&
+      req.url === "/admin/wallet-withdraw-complete"
+    ) {
+      const adminUser = getTelegramUserFromRequest(req);
+
+      if (!adminUser) {
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Telegram authentication required"
+        }));
+        return;
+      }
+
+      if (!isAdminTelegramUser(adminUser)) {
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Admin access required"
+        }));
+        return;
+      }
+
+      try {
+        const body = await readJsonBody(req);
+        const transactionId = Number(body.transactionId);
+        const blockchainTxid = String(body.blockchainTxid || "").trim();
+
+        if (!Number.isInteger(transactionId) || transactionId <= 0) {
+          res.end(JSON.stringify({
+            ok: false,
+            message: "Invalid transactionId"
+          }));
+          return;
+        }
+
+        if (!blockchainTxid || blockchainTxid.length < 10) {
+          res.end(JSON.stringify({
+            ok: false,
+            message: "Real blockchain TXID is required"
+          }));
+          return;
+        }
+
+        const client = await pool.connect();
+
+        try {
+          await client.query("BEGIN");
+
+          const txResult = await client.query(`
+            SELECT
+              id,
+              user_id,
+              amount,
+              currency,
+              status,
+              destination_address
+            FROM wallet_transactions
+            WHERE id = $1
+              AND type = 'WITHDRAW'
+            FOR UPDATE
+          `, [transactionId]);
+
+          if (txResult.rows.length === 0) {
+            await client.query("ROLLBACK");
+
+            res.end(JSON.stringify({
+              ok: false,
+              message: "Withdrawal transaction not found"
+            }));
+            return;
+          }
+
+          const withdrawal = txResult.rows[0];
+
+          if (withdrawal.status !== "PROCESSING") {
+            await client.query("ROLLBACK");
+
+            res.end(JSON.stringify({
+              ok: false,
+              message: "Withdrawal is not processing",
+              status: withdrawal.status
+            }));
+            return;
+          }
+
+          const walletResult = await client.query(`
+            SELECT
+              id,
+              balance,
+              locked_balance,
+              currency
+            FROM wallets
+            WHERE user_id = $1
+            FOR UPDATE
+          `, [withdrawal.user_id]);
+
+          if (walletResult.rows.length === 0) {
+            await client.query("ROLLBACK");
+
+            res.end(JSON.stringify({
+              ok: false,
+              message: "Wallet not found"
+            }));
+            return;
+          }
+
+          const wallet = walletResult.rows[0];
+          const amount = Number(withdrawal.amount);
+          const balance = Number(wallet.balance);
+          const lockedBalance = Number(wallet.locked_balance);
+
+          if (lockedBalance < amount || balance < amount) {
+            await client.query("ROLLBACK");
+
+            res.end(JSON.stringify({
+              ok: false,
+              message: "Wallet balance is inconsistent; reconciliation required"
+            }));
+            return;
+          }
+
+          const newBalance = balance - amount;
+          const newLockedBalance = lockedBalance - amount;
+
+          await client.query(`
+            UPDATE wallets
+            SET
+              balance = $1,
+              locked_balance = $2,
+              updated_at = NOW()
+            WHERE id = $3
+          `, [newBalance, newLockedBalance, wallet.id]);
+
+          const updateResult = await client.query(`
+            UPDATE wallet_transactions
+            SET
+              status = 'COMPLETED',
+              blockchain_txid = $1,
+              processed_at = NOW(),
+              error_message = NULL
+            WHERE id = $2
+              AND type = 'WITHDRAW'
+              AND status = 'PROCESSING'
+            RETURNING
+              id,
+              user_id,
+              amount,
+              currency,
+              status,
+              destination_address,
+              blockchain_txid,
+              processed_at
+          `, [blockchainTxid, transactionId]);
+
+          if (updateResult.rows.length === 0) {
+            await client.query("ROLLBACK");
+
+            res.end(JSON.stringify({
+              ok: false,
+              message: "Withdrawal completion failed"
+            }));
+            return;
+          }
+
+          await client.query("COMMIT");
+
+          const updated = updateResult.rows[0];
+
+          res.end(JSON.stringify({
+            ok: true,
+            action: "COMPLETE_WITHDRAWAL",
+            transactionId: updated.id,
+            userId: updated.user_id,
+            amount: Number(updated.amount),
+            currency: updated.currency,
+            destinationAddress: updated.destination_address,
+            status: updated.status,
+            blockchainTxid: updated.blockchain_txid,
+            processedAt: updated.processed_at,
+            balance: Number(newBalance.toFixed(8)),
+            lockedBalance: Number(newLockedBalance.toFixed(8))
+          }));
+
+        } catch (error) {
+          await client.query("ROLLBACK");
+          throw error;
+        } finally {
+          client.release();
+        }
+
+      } catch (error) {
+        console.log(
+          "ADMIN WITHDRAWAL COMPLETE ERROR:",
+          error.message
+        );
+
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Could not complete withdrawal"
+        }));
+      }
+
+      return;
+    }
+
+    // =========================
+    // ADMIN FAIL WITHDRAWAL
+    // =========================
+    if (
+      req.method === "POST" &&
+      req.url === "/admin/wallet-withdraw-fail"
+    ) {
+      const adminUser = getTelegramUserFromRequest(req);
+
+      if (!adminUser) {
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Telegram authentication required"
+        }));
+        return;
+      }
+
+      if (!isAdminTelegramUser(adminUser)) {
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Admin access required"
+        }));
+        return;
+      }
+
+      try {
+        const body = await readJsonBody(req);
+        const transactionId = Number(body.transactionId);
+        const errorMessage = String(body.errorMessage || "").trim();
+
+        if (!Number.isInteger(transactionId) || transactionId <= 0) {
+          res.end(JSON.stringify({
+            ok: false,
+            message: "Invalid transactionId"
+          }));
+          return;
+        }
+
+        if (!errorMessage) {
+          res.end(JSON.stringify({
+            ok: false,
+            message: "Failure reason is required"
+          }));
+          return;
+        }
+
+        const client = await pool.connect();
+
+        try {
+          await client.query("BEGIN");
+
+          const txResult = await client.query(`
+            SELECT
+              id,
+              user_id,
+              amount,
+              currency,
+              status
+            FROM wallet_transactions
+            WHERE id = $1
+              AND type = 'WITHDRAW'
+            FOR UPDATE
+          `, [transactionId]);
+
+          if (txResult.rows.length === 0) {
+            await client.query("ROLLBACK");
+
+            res.end(JSON.stringify({
+              ok: false,
+              message: "Withdrawal transaction not found"
+            }));
+            return;
+          }
+
+          const withdrawal = txResult.rows[0];
+
+          if (withdrawal.status !== "PROCESSING") {
+            await client.query("ROLLBACK");
+
+            res.end(JSON.stringify({
+              ok: false,
+              message: "Withdrawal is not processing",
+              status: withdrawal.status
+            }));
+            return;
+          }
+
+          const walletResult = await client.query(`
+            SELECT
+              id,
+              balance,
+              locked_balance
+            FROM wallets
+            WHERE user_id = $1
+            FOR UPDATE
+          `, [withdrawal.user_id]);
+
+          if (walletResult.rows.length === 0) {
+            await client.query("ROLLBACK");
+
+            res.end(JSON.stringify({
+              ok: false,
+              message: "Wallet not found"
+            }));
+            return;
+          }
+
+          const wallet = walletResult.rows[0];
+          const amount = Number(withdrawal.amount);
+          const lockedBalance = Number(wallet.locked_balance);
+
+          if (lockedBalance < amount) {
+            await client.query("ROLLBACK");
+
+            res.end(JSON.stringify({
+              ok: false,
+              message: "Locked balance is inconsistent; reconciliation required"
+            }));
+            return;
+          }
+
+          const newLockedBalance = lockedBalance - amount;
+
+          await client.query(`
+            UPDATE wallets
+            SET
+              locked_balance = $1,
+              updated_at = NOW()
+            WHERE id = $2
+          `, [newLockedBalance, wallet.id]);
+
+          const updateResult = await client.query(`
+            UPDATE wallet_transactions
+            SET
+              status = 'FAILED',
+              processed_at = NOW(),
+              error_message = $1
+            WHERE id = $2
+              AND type = 'WITHDRAW'
+              AND status = 'PROCESSING'
+            RETURNING
+              id,
+              user_id,
+              amount,
+              currency,
+              status,
+              processed_at,
+              error_message
+          `, [errorMessage, transactionId]);
+
+          if (updateResult.rows.length === 0) {
+            await client.query("ROLLBACK");
+
+            res.end(JSON.stringify({
+              ok: false,
+              message: "Withdrawal failure update failed"
+            }));
+            return;
+          }
+
+          await client.query("COMMIT");
+
+          const updated = updateResult.rows[0];
+
+          res.end(JSON.stringify({
+            ok: true,
+            action: "FAIL_WITHDRAWAL",
+            transactionId: updated.id,
+            userId: updated.user_id,
+            amount: Number(updated.amount),
+            currency: updated.currency,
+            status: updated.status,
+            processedAt: updated.processed_at,
+            errorMessage: updated.error_message,
+            lockedBalance: Number(newLockedBalance.toFixed(8))
+          }));
+
+        } catch (error) {
+          await client.query("ROLLBACK");
+          throw error;
+        } finally {
+          client.release();
+        }
+
+      } catch (error) {
+        console.log(
+          "ADMIN WITHDRAWAL FAIL ERROR:",
+          error.message
+        );
+
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Could not fail withdrawal"
+        }));
+      }
+
+      return;
+    }
+
+    // =========================
     // ADMIN START WITHDRAWAL PROCESSING
     // =========================
     if (
