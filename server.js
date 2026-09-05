@@ -273,6 +273,292 @@ function readJsonBody(req) {
   });
 }
 
+// =========================
+// Verify TRON USDT TRC20 Transaction
+// =========================
+async function verifyTronUsdtTransaction({
+  blockchainTxid,
+  destinationAddress,
+  amount
+}) {
+  const txid = String(blockchainTxid || "").trim();
+  const destination = String(destinationAddress || "").trim();
+  const withdrawalAmount = Number(amount);
+
+  if (!/^[a-fA-F0-9]{64}$/.test(txid)) {
+    return {
+      verified: false,
+      final: true,
+      reason: "Invalid TRON transaction ID"
+    };
+  }
+
+  if (!/^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(destination)) {
+    return {
+      verified: false,
+      final: true,
+      reason: "Invalid destination address"
+    };
+  }
+
+  if (!Number.isFinite(withdrawalAmount) || withdrawalAmount <= 0) {
+    return {
+      verified: false,
+      final: true,
+      reason: "Invalid withdrawal amount"
+    };
+  }
+
+  const fullnode =
+    String(process.env.TRON_FULLNODE || "").replace(/\/+$/, "");
+
+  const usdtContract =
+    String(process.env.TRON_USDT_CONTRACT || "").trim();
+
+  const treasuryAddress =
+    String(process.env.TRON_TREASURY_ADDRESS || "").trim();
+
+  if (!fullnode || !usdtContract || !treasuryAddress) {
+    throw new Error(
+      "TRON verification configuration is incomplete"
+    );
+  }
+
+  // =========================
+  // 1. Get transaction
+  // =========================
+  const txResponse = await fetch(
+    `${fullnode}/wallet/gettransactionbyid?value=${encodeURIComponent(txid)}`
+  );
+
+  if (!txResponse.ok) {
+    throw new Error(
+      `TRON transaction HTTP ${txResponse.status}`
+    );
+  }
+
+  const txData = await txResponse.json();
+
+  if (!txData || !txData.txID) {
+    return {
+      verified: false,
+      final: false,
+      reason: "TRON transaction not found"
+    };
+  }
+
+  // =========================
+  // 2. Validate transaction type
+  // =========================
+  const contract =
+    txData?.raw_data?.contract?.[0];
+
+  if (!contract || contract.type !== "TriggerSmartContract") {
+    return {
+      verified: false,
+      final: true,
+      reason: "Transaction is not a TRC20 contract transaction"
+    };
+  }
+
+  const parameter =
+    contract?.parameter?.value;
+
+  if (!parameter) {
+    return {
+      verified: false,
+      final: true,
+      reason: "TRC20 transaction parameters missing"
+    };
+  }
+
+  // =========================
+  // 3. Normalize TRON address
+  // =========================
+  function normalizeTronHexAddress(value) {
+    const hex = String(value || "").trim();
+
+    if (!hex) {
+      return "";
+    }
+
+    const normalized =
+      hex.startsWith("41")
+        ? hex
+        : `41${hex}`;
+
+    try {
+      return TronWeb.address.fromHex(normalized);
+    } catch (error) {
+      return "";
+    }
+  }
+
+  const senderAddress =
+    normalizeTronHexAddress(
+      parameter.owner_address
+    );
+
+  const contractAddress =
+    normalizeTronHexAddress(
+      parameter.contract_address
+    );
+
+  if (senderAddress !== treasuryAddress) {
+    return {
+      verified: false,
+      final: true,
+      reason: "Transaction sender is not treasury"
+    };
+  }
+
+  if (contractAddress !== usdtContract) {
+    return {
+      verified: false,
+      final: true,
+      reason: "Transaction contract is not configured USDT"
+    };
+  }
+
+  // =========================
+  // 4. Get solidified receipt
+  // =========================
+  const receiptResponse = await fetch(
+    `${fullnode}/walletsolidity/gettransactioninfobyid?value=${encodeURIComponent(txid)}`
+  );
+
+  if (!receiptResponse.ok) {
+    throw new Error(
+      `TRON receipt HTTP ${receiptResponse.status}`
+    );
+  }
+
+  const receipt = await receiptResponse.json();
+
+  if (!receipt || !receipt.id) {
+    return {
+      verified: false,
+      final: false,
+      reason: "Transaction is not solidified yet"
+    };
+  }
+
+  if (receipt?.receipt?.result !== "SUCCESS") {
+    return {
+      verified: false,
+      final: receipt?.receipt?.result ? true : false,
+      reason: receipt?.receipt?.result
+        ? "TRON transaction failed"
+        : "TRON receipt result not available"
+    };
+  }
+
+  // =========================
+  // 5. Find USDT Transfer event
+  // =========================
+  const logs =
+    Array.isArray(receipt.log)
+      ? receipt.log
+      : [];
+
+  const transferTopic =
+    "ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55aeb";
+
+  const amountString = String(amount).trim();
+
+  if (!/^\d+(?:\.\d{1,6})?$/.test(amountString)) {
+    return {
+      verified: false,
+      final: true,
+      reason: "Withdrawal amount must have at most 6 decimal places"
+    };
+  }
+
+  const [wholePart, decimalPart = ""] =
+    amountString.split(".");
+
+  const expectedRawAmount =
+    BigInt(wholePart) * 1_000_000n +
+    BigInt((decimalPart + "000000").slice(0, 6));
+
+  const expectedContract =
+    String(usdtContract).toLowerCase();
+
+  for (const log of logs) {
+    const logAddress =
+      normalizeTronHexAddress(
+        log.address
+      );
+
+    if (
+      String(logAddress).toLowerCase() !==
+      expectedContract
+    ) {
+      continue;
+    }
+
+    const topics =
+      Array.isArray(log.topics)
+        ? log.topics
+        : [];
+
+    if (
+      String(topics[0] || "").toLowerCase() !==
+      transferTopic
+    ) {
+      continue;
+    }
+
+    if (
+      !topics[1] ||
+      !topics[2] ||
+      !log.data
+    ) {
+      continue;
+    }
+
+    const fromAddress =
+      normalizeTronHexAddress(
+        String(topics[1]).slice(-40)
+      );
+
+    const toAddress =
+      normalizeTronHexAddress(
+        String(topics[2]).slice(-40)
+      );
+
+    let rawValue;
+
+    try {
+      rawValue =
+        BigInt(`0x${String(log.data)}`);
+    } catch (error) {
+      continue;
+    }
+
+    if (
+      fromAddress === treasuryAddress &&
+      toAddress === destination &&
+      rawValue === expectedRawAmount
+    ) {
+      return {
+        verified: true,
+        final: true,
+        reason: "Verified TRC20 USDT transfer",
+        txid,
+        amount: amountString,
+        destination: toAddress
+      };
+    }
+  }
+
+  return {
+    verified: false,
+    final: true,
+    reason: "Matching USDT Transfer event not found"
+  };
+}
+
 const PORT = 3000;
 
 let botStatus = "stopped";
@@ -4211,7 +4497,9 @@ if (confirmUrl.pathname === "/wallet-confirm-withdraw") {
       try {
         const body = await readJsonBody(req);
         const transactionId = Number(body.transactionId);
-        const blockchainTxid = String(body.blockchainTxid || "").trim();
+        const blockchainTxid = String(
+          body.blockchainTxid || ""
+        ).trim();
 
         if (!Number.isInteger(transactionId) || transactionId <= 0) {
           res.end(JSON.stringify({
@@ -4221,14 +4509,85 @@ if (confirmUrl.pathname === "/wallet-confirm-withdraw") {
           return;
         }
 
-        if (!blockchainTxid || blockchainTxid.length < 10) {
+        if (!/^[a-fA-F0-9]{64}$/.test(blockchainTxid)) {
           res.end(JSON.stringify({
             ok: false,
-            message: "Real blockchain TXID is required"
+            message: "Valid TRON blockchain TXID is required"
           }));
           return;
         }
 
+        // ==========================================
+        // 1. Read withdrawal without holding DB lock
+        // ==========================================
+        const lookupClient = await pool.connect();
+
+        let withdrawal;
+
+        try {
+          const txResult = await lookupClient.query(`
+            SELECT
+              id,
+              user_id,
+              amount,
+              currency,
+              status,
+              destination_address
+            FROM wallet_transactions
+            WHERE id = $1
+              AND type = 'WITHDRAW'
+          `, [transactionId]);
+
+          if (txResult.rows.length === 0) {
+            res.end(JSON.stringify({
+              ok: false,
+              message: "Withdrawal transaction not found"
+            }));
+            return;
+          }
+
+          withdrawal = txResult.rows[0];
+
+        } finally {
+          lookupClient.release();
+        }
+
+        if (withdrawal.status !== "PROCESSING") {
+          res.end(JSON.stringify({
+            ok: false,
+            message: "Withdrawal is not processing",
+            status: withdrawal.status
+          }));
+          return;
+        }
+
+        // ==========================================
+        // 2. Verify real TRON USDT transfer first
+        // ==========================================
+        const verification =
+          await verifyTronUsdtTransaction({
+            blockchainTxid,
+            destinationAddress: withdrawal.destination_address,
+            amount: withdrawal.amount
+          });
+
+        if (!verification.verified) {
+          res.end(JSON.stringify({
+            ok: false,
+            action: "WITHDRAWAL_NOT_COMPLETED",
+            transactionId: withdrawal.id,
+            status: withdrawal.status,
+            blockchainTxid,
+            verified: false,
+            final: verification.final,
+            message: verification.reason
+          }));
+          return;
+        }
+
+        // ==========================================
+        // 3. Finalize ledger only after verification
+        // ==========================================
         const client = await pool.connect();
 
         try {
@@ -4258,15 +4617,32 @@ if (confirmUrl.pathname === "/wallet-confirm-withdraw") {
             return;
           }
 
-          const withdrawal = txResult.rows[0];
+          const lockedWithdrawal = txResult.rows[0];
 
-          if (withdrawal.status !== "PROCESSING") {
+          if (lockedWithdrawal.status !== "PROCESSING") {
             await client.query("ROLLBACK");
 
             res.end(JSON.stringify({
               ok: false,
               message: "Withdrawal is not processing",
-              status: withdrawal.status
+              status: lockedWithdrawal.status
+            }));
+            return;
+          }
+
+          // Re-check the verified destination and amount
+          // against the currently locked withdrawal row.
+          if (
+            lockedWithdrawal.destination_address !==
+              withdrawal.destination_address ||
+            String(lockedWithdrawal.amount) !==
+              String(withdrawal.amount)
+          ) {
+            await client.query("ROLLBACK");
+
+            res.end(JSON.stringify({
+              ok: false,
+              message: "Withdrawal changed during verification; reconciliation required"
             }));
             return;
           }
@@ -4280,7 +4656,7 @@ if (confirmUrl.pathname === "/wallet-confirm-withdraw") {
             FROM wallets
             WHERE user_id = $1
             FOR UPDATE
-          `, [withdrawal.user_id]);
+          `, [lockedWithdrawal.user_id]);
 
           if (walletResult.rows.length === 0) {
             await client.query("ROLLBACK");
@@ -4293,11 +4669,54 @@ if (confirmUrl.pathname === "/wallet-confirm-withdraw") {
           }
 
           const wallet = walletResult.rows[0];
-          const amount = Number(withdrawal.amount);
-          const balance = Number(wallet.balance);
-          const lockedBalance = Number(wallet.locked_balance);
 
-          if (lockedBalance < amount || balance < amount) {
+          const amount = String(
+            lockedWithdrawal.amount
+          );
+
+          const balance = String(
+            wallet.balance
+          );
+
+          const lockedBalance = String(
+            wallet.locked_balance
+          );
+
+          const amountNumeric =
+            Number(amount);
+
+          if (
+            !Number.isFinite(amountNumeric) ||
+            amountNumeric <= 0
+          ) {
+            await client.query("ROLLBACK");
+
+            res.end(JSON.stringify({
+              ok: false,
+              message: "Invalid withdrawal amount; reconciliation required"
+            }));
+            return;
+          }
+
+          const balanceCheck = await client.query(`
+            SELECT
+              balance >= $1::numeric AS balance_ok,
+              locked_balance >= $1::numeric AS locked_ok
+            FROM wallets
+            WHERE id = $2
+          `, [
+            amount,
+            wallet.id
+          ]);
+
+          const balanceCheckRow =
+            balanceCheck.rows[0];
+
+          if (
+            !balanceCheckRow ||
+            !balanceCheckRow.balance_ok ||
+            !balanceCheckRow.locked_ok
+          ) {
             await client.query("ROLLBACK");
 
             res.end(JSON.stringify({
@@ -4307,17 +4726,38 @@ if (confirmUrl.pathname === "/wallet-confirm-withdraw") {
             return;
           }
 
-          const newBalance = balance - amount;
-          const newLockedBalance = lockedBalance - amount;
-
-          await client.query(`
+          const balanceUpdate = await client.query(`
             UPDATE wallets
             SET
-              balance = $1,
-              locked_balance = $2,
+              balance = balance - $1::numeric,
+              locked_balance = locked_balance - $1::numeric,
               updated_at = NOW()
-            WHERE id = $3
-          `, [newBalance, newLockedBalance, wallet.id]);
+            WHERE id = $2
+              AND balance >= $1::numeric
+              AND locked_balance >= $1::numeric
+            RETURNING
+              balance,
+              locked_balance
+          `, [
+            amount,
+            wallet.id
+          ]);
+
+          if (balanceUpdate.rows.length === 0) {
+            await client.query("ROLLBACK");
+
+            res.end(JSON.stringify({
+              ok: false,
+              message: "Wallet balance changed during completion; reconciliation required"
+            }));
+            return;
+          }
+
+          const newBalance =
+            Number(balanceUpdate.rows[0].balance);
+
+          const newLockedBalance =
+            Number(balanceUpdate.rows[0].locked_balance);
 
           const updateResult = await client.query(`
             UPDATE wallet_transactions
@@ -4338,7 +4778,10 @@ if (confirmUrl.pathname === "/wallet-confirm-withdraw") {
               destination_address,
               blockchain_txid,
               processed_at
-          `, [blockchainTxid, transactionId]);
+          `, [
+            blockchainTxid,
+            transactionId
+          ]);
 
           if (updateResult.rows.length === 0) {
             await client.query("ROLLBACK");
