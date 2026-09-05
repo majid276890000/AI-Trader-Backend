@@ -2795,14 +2795,29 @@ const server = http.createServer(
 }
 
     // =========================
-    // WALLET WITHDRAW - TEST
+    // WALLET WITHDRAW - TRC20
     // =========================
     const withdrawUrl = new URL(req.url, "http://localhost");
 
-    if (withdrawUrl.pathname === "/wallet-withdraw") {
+    if (
+      req.method === "POST" &&
+      withdrawUrl.pathname === "/wallet-withdraw"
+    ) {
 
-  const amount = Number(withdrawUrl.searchParams.get("amount"));
-  
+  const amountString =
+    String(withdrawUrl.searchParams.get("amount") || "").trim();
+
+  if (!/^\d+(?:\.\d{1,6})?$/.test(amountString)) {
+    res.end(JSON.stringify({
+      ok: false,
+      message: "Invalid withdrawal amount"
+    }));
+    return;
+  }
+
+  const amount = Number(amountString);
+
+
   if (!Number.isFinite(amount) || amount <= 0) {
     res.end(JSON.stringify({
       ok: false,
@@ -2871,8 +2886,29 @@ const server = http.createServer(
       }
 
       const row = walletResult.rows[0];
-      const balance = Number(row.balance);
-      const lockedBalance = Number(row.locked_balance);
+
+      const balanceString = String(row.balance);
+      const lockedBalanceString = String(row.locked_balance);
+
+      const balance = Number(balanceString);
+      const lockedBalance = Number(lockedBalanceString);
+
+      if (
+        !Number.isFinite(balance) ||
+        !Number.isFinite(lockedBalance) ||
+        balance < 0 ||
+        lockedBalance < 0
+      ) {
+        await client.query("ROLLBACK");
+
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Wallet balance is inconsistent; reconciliation required"
+        }));
+
+        return;
+      }
+
       const availableBalance = balance - lockedBalance;
 
       if (amount > availableBalance) {
@@ -2941,14 +2977,37 @@ const server = http.createServer(
         return;
       }
 
-      const newLockedBalance = lockedBalance + amount;
-
-      await client.query(`
+      const lockResult = await client.query(`
         UPDATE wallets
-        SET locked_balance = $1,
-            updated_at = NOW()
+        SET
+          locked_balance = locked_balance + $1::numeric,
+          updated_at = NOW()
         WHERE id = $2
-      `, [newLockedBalance, row.id]);
+          AND balance - locked_balance >= $1::numeric
+        RETURNING
+          balance,
+          locked_balance
+      `, [
+        amountString,
+        row.id
+      ]);
+
+      if (lockResult.rows.length === 0) {
+        await client.query("ROLLBACK");
+
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Wallet balance changed during withdrawal; reconciliation required"
+        }));
+
+        return;
+      }
+
+      const newBalance =
+        Number(lockResult.rows[0].balance);
+
+      const newLockedBalance =
+        Number(lockResult.rows[0].locked_balance);
 
       const transactionResult = await client.query(`
         INSERT INTO wallet_transactions
@@ -2971,9 +3030,9 @@ const server = http.createServer(
         transactionId: transactionResult.rows[0].id,
         amount: amount,
         destinationAddress: transactionResult.rows[0].destination_address,
-        balance: Number(balance.toFixed(2)),
+        balance: Number(newBalance.toFixed(2)),
         availableBalance: Number(
-          (balance - newLockedBalance).toFixed(2)
+          (newBalance - newLockedBalance).toFixed(2)
         ),
         lockedBalance: Number(newLockedBalance.toFixed(2)),
         status: "PENDING",
