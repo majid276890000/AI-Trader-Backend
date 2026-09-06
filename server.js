@@ -104,7 +104,9 @@ async function getOrCreateTelegramWallet(telegramUser) {
         tron_address,
         tron_network,
         tron_address_status,
-        deposit_enabled
+        deposit_enabled,
+        deposit_tron_address,
+        deposit_tron_network
     `, [user.id]);
 
     await client.query("COMMIT");
@@ -462,7 +464,7 @@ async function verifyTronUsdtTransaction({
       : [];
 
   const transferTopic =
-    "ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55aeb";
+    "ddf252ad1be2c89b69c2b068fc378daa951ba7f163c4a11628f55a4df523b3ef";
 
   const amountString = String(amount).trim();
 
@@ -559,6 +561,251 @@ async function verifyTronUsdtTransaction({
   };
 }
 
+
+// =========================
+// Verify TRON USDT TRC20 Deposit
+// =========================
+async function verifyTronUsdtDeposit({
+  blockchainTxid,
+  destinationAddress
+}) {
+  const txid = String(blockchainTxid || "").trim();
+  const destination = String(destinationAddress || "").trim();
+
+  if (!/^[a-fA-F0-9]{64}$/.test(txid)) {
+    return {
+      verified: false,
+      final: true,
+      reason: "Invalid TRON transaction ID"
+    };
+  }
+
+  if (!/^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(destination)) {
+    return {
+      verified: false,
+      final: true,
+      reason: "Invalid deposit address"
+    };
+  }
+
+  const fullnode =
+    String(process.env.TRON_FULLNODE || "").replace(/\/+$/, "");
+
+  const usdtContract =
+    String(process.env.TRON_USDT_CONTRACT || "").trim();
+
+  if (!fullnode || !usdtContract) {
+    throw new Error(
+      "TRON deposit verification configuration is incomplete"
+    );
+  }
+
+  const txResponse = await fetch(
+    `${fullnode}/wallet/gettransactionbyid?value=${encodeURIComponent(txid)}`
+  );
+
+  if (!txResponse.ok) {
+    throw new Error(
+      `TRON transaction HTTP ${txResponse.status}`
+    );
+  }
+
+  const txData = await txResponse.json();
+
+  if (!txData || txData.txID !== txid) {
+    return {
+      verified: false,
+      final: false,
+      reason: "TRON transaction not found"
+    };
+  }
+
+  const contract =
+    txData?.raw_data?.contract?.[0];
+
+  if (
+    !contract ||
+    contract.type !== "TriggerSmartContract"
+  ) {
+    return {
+      verified: false,
+      final: true,
+      reason: "Transaction is not a TRC20 contract transaction"
+    };
+  }
+
+  const parameter =
+    contract?.parameter?.value;
+
+  if (!parameter) {
+    return {
+      verified: false,
+      final: true,
+      reason: "TRC20 transaction parameters missing"
+    };
+  }
+
+  function normalizeDepositTronHexAddress(value) {
+    const hex = String(value || "").trim();
+
+    if (!hex) {
+      return "";
+    }
+
+    const normalized =
+      hex.startsWith("41")
+        ? hex
+        : `41${hex}`;
+
+    try {
+      return TronWeb.address.fromHex(normalized);
+    } catch (error) {
+      return "";
+    }
+  }
+
+  const contractAddress =
+    normalizeDepositTronHexAddress(
+      parameter.contract_address
+    );
+
+  if (
+    String(contractAddress).toLowerCase() !==
+    String(usdtContract).toLowerCase()
+  ) {
+    return {
+      verified: false,
+      final: true,
+      reason: "Transaction contract is not configured USDT"
+    };
+  }
+
+  const receiptResponse = await fetch(
+    `${fullnode}/walletsolidity/gettransactioninfobyid?value=${encodeURIComponent(txid)}`
+  );
+
+  if (!receiptResponse.ok) {
+    throw new Error(
+      `TRON receipt HTTP ${receiptResponse.status}`
+    );
+  }
+
+  const receipt = await receiptResponse.json();
+
+  if (!receipt || receipt.id !== txid) {
+    return {
+      verified: false,
+      final: false,
+      reason: "Transaction is not solidified yet"
+    };
+  }
+
+  if (receipt?.receipt?.result !== "SUCCESS") {
+    return {
+      verified: false,
+      final: true,
+      reason: "TRON transaction failed"
+    };
+  }
+
+  const logs =
+    Array.isArray(receipt.log)
+      ? receipt.log
+      : [];
+
+  const transferTopic =
+    "ddf252ad1be2c89b69c2b068fc378daa951ba7f163c4a11628f55a4df523b3ef";
+
+  for (const log of logs) {
+    const logAddress =
+      normalizeDepositTronHexAddress(
+        log.address
+      );
+
+    if (
+      String(logAddress).toLowerCase() !==
+      String(usdtContract).toLowerCase()
+    ) {
+      continue;
+    }
+
+    const topics =
+      Array.isArray(log.topics)
+        ? log.topics
+        : [];
+
+    if (
+      String(topics[0] || "").toLowerCase() !==
+      transferTopic
+    ) {
+      continue;
+    }
+
+    if (
+      !topics[1] ||
+      !topics[2] ||
+      !log.data
+    ) {
+      continue;
+    }
+
+    const fromAddress =
+      normalizeDepositTronHexAddress(
+        String(topics[1]).slice(-40)
+      );
+
+    const toAddress =
+      normalizeDepositTronHexAddress(
+        String(topics[2]).slice(-40)
+      );
+
+    if (toAddress !== destination) {
+      continue;
+    }
+
+    if (String(log.data).length !== 64) {
+      continue;
+    }
+
+    let rawValue;
+
+    try {
+      rawValue =
+        BigInt(`0x${String(log.data)}`);
+    } catch (error) {
+      continue;
+    }
+
+    if (rawValue <= 0n) {
+      continue;
+    }
+
+    const amount =
+      Number(rawValue) / 1_000_000;
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      continue;
+    }
+
+    return {
+      verified: true,
+      final: true,
+      reason: "Verified TRC20 USDT deposit",
+      txid,
+      amountRaw: rawValue.toString(),
+      amount: amount.toFixed(6),
+      from: fromAddress,
+      destination: toAddress
+    };
+  }
+
+  return {
+    verified: false,
+    final: true,
+    reason: "Matching USDT deposit Transfer event not found"
+  };
+}
+
 const PORT = 3000;
 
 let botStatus = "stopped";
@@ -570,6 +817,290 @@ let balance = 1000;
 let paperPosition = 0;
 let paperEntryPrice = 0;
 
+
+// =========================
+// TRC20 Fee / Energy Estimation
+// =========================
+async function estimateTrc20TransferFeeLimit({
+  destinationAddress,
+  rawAmount
+}) {
+  const fullNode =
+    String(process.env.TRON_FULLNODE || "").trim();
+
+  const contract =
+    String(process.env.TRON_USDT_CONTRACT || "").trim();
+
+  const owner =
+    String(process.env.TRON_TREASURY_ADDRESS || "").trim();
+
+  if (!fullNode || !contract || !owner) {
+    throw new Error(
+      "TRON fee estimation configuration is incomplete"
+    );
+  }
+
+  if (!/^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(destinationAddress)) {
+    throw new Error("Invalid TRON destination address");
+  }
+
+  const amountString = String(rawAmount || "").trim();
+
+  if (!/^\d+$/.test(amountString) || BigInt(amountString) <= 0n) {
+    throw new Error("Invalid TRC20 raw amount");
+  }
+
+  const tronWeb =
+    new TronWeb({ fullHost: fullNode });
+
+  const parameter =
+    tronWeb.utils.abi
+      .encodeParams(
+        ["address", "uint256"],
+        [destinationAddress, amountString]
+      )
+      .replace(/^0x/, "");
+
+  const estimateResponse =
+    await fetch(
+      fullNode + "/wallet/triggerconstantcontract",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          owner_address: owner,
+          contract_address: contract,
+          function_selector:
+            "transfer(address,uint256)",
+          parameter,
+          call_value: 0,
+          visible: true
+        })
+      }
+    );
+
+  const estimate =
+    await estimateResponse.json();
+
+  if (!estimateResponse.ok) {
+    throw new Error(
+      "TRON energy estimation HTTP error"
+    );
+  }
+
+  if (
+    !estimate.result ||
+    estimate.result.result !== true
+  ) {
+    throw new Error(
+      estimate.result?.message ||
+      "TRON energy estimation failed"
+    );
+  }
+
+  const energyUsed =
+    Number(estimate.energy_used);
+
+  if (
+    !Number.isFinite(energyUsed) ||
+    energyUsed <= 0
+  ) {
+    throw new Error(
+      "TRON energy estimate is invalid"
+    );
+  }
+
+  const parametersResponse =
+    await fetch(
+      fullNode + "/wallet/getchainparameters"
+    );
+
+  const parameters =
+    await parametersResponse.json();
+
+  const chainParameters =
+    Array.isArray(parameters.chainParameter)
+      ? parameters.chainParameter
+      : [];
+
+  const energyFeeParameter =
+    chainParameters.find(
+      item => item.key === "getEnergyFee"
+    );
+
+  const maxFeeLimitParameter =
+    chainParameters.find(
+      item => item.key === "getMaxFeeLimit"
+    );
+
+  const energyFee =
+    Number(energyFeeParameter?.value);
+
+  const maxFeeLimit =
+    Number(maxFeeLimitParameter?.value);
+
+  if (
+    !Number.isFinite(energyFee) ||
+    energyFee <= 0 ||
+    !Number.isFinite(maxFeeLimit) ||
+    maxFeeLimit <= 0
+  ) {
+    throw new Error(
+      "Invalid TRON fee parameters"
+    );
+  }
+
+  // 30% safety buffer for dynamic Energy/state changes.
+  const safetyMultiplier = 1.30;
+
+  const estimatedFeeLimit =
+    Math.ceil(
+      energyUsed *
+      energyFee *
+      safetyMultiplier
+    );
+
+  const feeLimit =
+    Math.min(
+      estimatedFeeLimit,
+      maxFeeLimit
+    );
+
+  if (feeLimit <= 0) {
+    throw new Error(
+      "Calculated fee limit is invalid"
+    );
+  }
+
+  return {
+    energyUsed,
+    energyFee,
+    maxFeeLimit,
+    safetyMultiplier,
+    feeLimit
+  };
+}
+
+// =========================
+// TRC20 Withdrawal Transaction Builder
+// =========================
+async function buildTrc20UsdtWithdrawalTransaction({
+  destinationAddress,
+  amount
+}) {
+  const fullNode =
+    String(process.env.TRON_FULLNODE || "").trim();
+
+  const contract =
+    String(process.env.TRON_USDT_CONTRACT || "").trim();
+
+  const owner =
+    String(process.env.TRON_TREASURY_ADDRESS || "").trim();
+
+  if (!fullNode || !contract || !owner) {
+    throw new Error(
+      "TRON withdrawal configuration is incomplete"
+    );
+  }
+
+  if (!/^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(destinationAddress)) {
+    throw new Error(
+      "Invalid TRON destination address"
+    );
+  }
+
+  const amountString =
+    String(amount || "").trim();
+
+  if (!/^\d+(?:\.\d{1,6})?$/.test(amountString)) {
+    throw new Error(
+      "Withdrawal amount must have at most 6 decimal places"
+    );
+  }
+
+  const [wholePart, decimalPart = ""] =
+    amountString.split(".");
+
+  const rawAmount =
+    (
+      BigInt(wholePart) * 1_000_000n +
+      BigInt(
+        (decimalPart + "000000").slice(0, 6)
+      )
+    ).toString();
+
+  if (BigInt(rawAmount) <= 0n) {
+    throw new Error(
+      "Withdrawal amount must be greater than zero"
+    );
+  }
+
+  const feeInfo =
+    await estimateTrc20TransferFeeLimit({
+      destinationAddress,
+      rawAmount
+    });
+
+  const tronWeb =
+    new TronWeb({
+      fullHost
+    });
+
+  const transactionResult =
+    await tronWeb.transactionBuilder.triggerSmartContract(
+      contract,
+      "transfer(address,uint256)",
+      {
+        feeLimit: feeInfo.feeLimit,
+        callValue: 0
+      },
+      [
+        {
+          type: "address",
+          value: destinationAddress
+        },
+        {
+          type: "uint256",
+          value: rawAmount
+        }
+      ],
+      owner
+    );
+
+  if (
+    !transactionResult ||
+    transactionResult.result?.result !== true ||
+    !transactionResult.transaction
+  ) {
+    throw new Error(
+      "TRON withdrawal transaction construction failed"
+    );
+  }
+
+  return {
+    transaction: transactionResult.transaction,
+    txID:
+      transactionResult.transaction.txID || null,
+    rawDataHex:
+      transactionResult.transaction.raw_data_hex || null,
+    feeLimit: feeInfo.feeLimit,
+    energyUsed: feeInfo.energyUsed,
+    energyFee: feeInfo.energyFee,
+    maxFeeLimit: feeInfo.maxFeeLimit,
+    rawAmount
+  };
+}
+
+// =========================
+// SECURE TRON SIGNER INTERFACE
+// =========================
+// Signing is intentionally disabled until a secure external signer
+// (KMS/HSM/custody service) is connected.
+async function signTronTransaction() {
+  throw new Error("TRON transaction signing is disabled: secure signer not configured");
+}
 
 // =========================
 // Wallet Ledger
@@ -2536,6 +3067,56 @@ const server = http.createServer(
 
     // =========================
     // =========================
+    // WALLET DEPOSIT ADDRESS
+    // =========================
+    if (
+      req.method === "GET" &&
+      req.url === "/wallet-deposit-address"
+    ) {
+      const telegramUser = getTelegramUserFromRequest(req);
+
+      if (!telegramUser) {
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Telegram authentication required"
+        }));
+        return;
+      }
+
+      try {
+        const result = await getOrCreateTelegramWallet(telegramUser);
+        const wallet = result.wallet;
+
+        const depositAddress =
+          wallet.deposit_tron_address || null;
+
+        const depositEnabled =
+          wallet.deposit_enabled === true &&
+          !!depositAddress;
+
+        res.end(JSON.stringify({
+          ok: true,
+          network: wallet.deposit_tron_network || "TRC20",
+          address: depositAddress,
+          depositEnabled
+        }));
+
+      } catch (error) {
+        console.log(
+          "DEPOSIT ADDRESS GET ERROR:",
+          error.message
+        );
+
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Could not load deposit address"
+        }));
+      }
+
+      return;
+    }
+
+    // =========================
     // WALLET TRON ADDRESS
     // =========================
     if (
@@ -2672,127 +3253,293 @@ const server = http.createServer(
       return;
     }
 
-    // WALLET DEPOSIT - TEST
+    // =========================
+    // WALLET DEPOSIT - REAL TRC20
     // =========================
     const depositUrl = new URL(req.url, "http://localhost");
-    if (depositUrl.pathname === "/wallet-deposit") {
 
-  const amount = Number(depositUrl.searchParams.get("amount"));
-
-  if (Number.isFinite(amount) === false || amount <= 0) {
-    res.end(JSON.stringify({ok:false,message:"Invalid deposit amount"}));
-    return;
-  }
-
-  try {
-    const client = await pool.connect();
-
-    try {
-      await client.query("BEGIN");
-
+    if (
+      req.method === "POST" &&
+      depositUrl.pathname === "/wallet-deposit"
+    ) {
       const telegramUser = getTelegramUserFromRequest(req);
 
       if (!telegramUser) {
-        await client.query("ROLLBACK");
-
         res.end(JSON.stringify({
           ok: false,
           message: "Telegram authentication required"
         }));
-
         return;
       }
 
-      const walletData =
-        await getOrCreateTelegramWallet(telegramUser);
+      try {
+        const body = await readJsonBody(req);
 
-      if (!walletData) {
-        await client.query("ROLLBACK");
+        const txid =
+          String(body.txid || "").trim();
+
+        if (!/^[a-fA-F0-9]{64}$/.test(txid)) {
+          res.end(JSON.stringify({
+            ok: false,
+            message: "Invalid TRON transaction ID"
+          }));
+          return;
+        }
+
+        const walletData =
+          await getOrCreateTelegramWallet(telegramUser);
+
+        if (!walletData) {
+          res.end(JSON.stringify({
+            ok: false,
+            message: "Telegram user not found"
+          }));
+          return;
+        }
+
+        const walletRow = walletData.wallet;
+
+        const destination =
+          String(
+            walletRow.deposit_tron_address || ""
+          ).trim();
+
+        if (
+          walletRow.deposit_enabled !== true ||
+          !destination
+        ) {
+          res.end(JSON.stringify({
+            ok: false,
+            message: "TRC20 deposit is not enabled for this wallet"
+          }));
+          return;
+        }
+
+        const existing =
+          await pool.query(
+            `SELECT id, user_id, amount, status
+             FROM wallet_transactions
+             WHERE blockchain_txid = $1
+             LIMIT 1`,
+            [txid]
+          );
+
+        if (existing.rows.length > 0) {
+          const tx = existing.rows[0];
+
+          res.end(JSON.stringify({
+            ok: false,
+            message: "This blockchain transaction has already been processed",
+            transactionId: tx.id,
+            status: tx.status
+          }));
+          return;
+        }
+
+        const verification =
+          await verifyTronUsdtDeposit({
+            blockchainTxid: txid,
+            destinationAddress: destination
+          });
+
+        if (!verification.verified) {
+          res.end(JSON.stringify({
+            ok: false,
+            message: verification.reason || "Deposit verification failed",
+            final: verification.final
+          }));
+          return;
+        }
+
+        const client = await pool.connect();
+
+        try {
+          await client.query("BEGIN");
+
+          const walletResult =
+            await client.query(
+              `SELECT
+                 id,
+                 user_id,
+                 balance,
+                 locked_balance,
+                 currency,
+                 deposit_tron_address,
+                 deposit_enabled
+               FROM wallets
+               WHERE id = $1
+               FOR UPDATE`,
+              [walletRow.id]
+            );
+
+          if (walletResult.rows.length === 0) {
+            await client.query("ROLLBACK");
+
+            res.end(JSON.stringify({
+              ok: false,
+              message: "Wallet not found"
+            }));
+            return;
+          }
+
+          const lockedWallet =
+            walletResult.rows[0];
+
+          if (
+            lockedWallet.deposit_enabled !== true ||
+            String(
+              lockedWallet.deposit_tron_address || ""
+            ).trim() !== destination
+          ) {
+            await client.query("ROLLBACK");
+
+            res.end(JSON.stringify({
+              ok: false,
+              message: "Deposit address is no longer active"
+            }));
+            return;
+          }
+
+          const duplicate =
+            await client.query(
+              `SELECT id
+               FROM wallet_transactions
+               WHERE blockchain_txid = $1
+               FOR UPDATE`,
+              [txid]
+            );
+
+          if (duplicate.rows.length > 0) {
+            await client.query("ROLLBACK");
+
+            res.end(JSON.stringify({
+              ok: false,
+              message: "This blockchain transaction has already been processed",
+              transactionId: duplicate.rows[0].id
+            }));
+            return;
+          }
+
+          const balanceResult =
+            await client.query(
+              `UPDATE wallets
+               SET
+                 balance = balance + $1::numeric,
+                 updated_at = NOW()
+               WHERE id = $2
+               RETURNING balance, locked_balance, currency`,
+              [
+                verification.amount,
+                lockedWallet.id
+              ]
+            );
+
+          if (balanceResult.rows.length === 0) {
+            await client.query("ROLLBACK");
+
+            res.end(JSON.stringify({
+              ok: false,
+              message: "Could not update wallet balance"
+            }));
+            return;
+          }
+
+          const balanceRow =
+            balanceResult.rows[0];
+
+          const transactionResult =
+            await client.query(
+              `INSERT INTO wallet_transactions (
+                 user_id,
+                 type,
+                 amount,
+                 currency,
+                 status,
+                 description,
+                 destination_address,
+                 blockchain_txid,
+                 processed_at
+               )
+               VALUES (
+                 $1,
+                 'DEPOSIT',
+                 $2::numeric,
+                 'USDT',
+                 'COMPLETED',
+                 $3,
+                 $4,
+                 $5,
+                 NOW()
+               )
+               RETURNING id`,
+              [
+                lockedWallet.user_id,
+                verification.amount,
+                "Verified TRC20 USDT deposit",
+                destination,
+                txid
+              ]
+            );
+
+          await client.query("COMMIT");
+
+          const newBalance =
+            Number(balanceRow.balance);
+
+          const lockedBalance =
+            Number(balanceRow.locked_balance);
+
+          res.end(JSON.stringify({
+            ok: true,
+            transactionId:
+              transactionResult.rows[0].id,
+            status: "COMPLETED",
+            amount: verification.amount,
+            currency: balanceRow.currency,
+            balance: Number(newBalance.toFixed(6)),
+            availableBalance:
+              Number(
+                (newBalance - lockedBalance)
+                  .toFixed(6)
+              ),
+            lockedBalance:
+              Number(lockedBalance.toFixed(6)),
+            blockchainTxid: txid
+          }));
+
+        } catch (error) {
+          try {
+            await client.query("ROLLBACK");
+          } catch {}
+
+          if (error && error.code === "23505") {
+            res.end(JSON.stringify({
+              ok: false,
+              message: "This blockchain transaction has already been processed"
+            }));
+            return;
+          }
+
+          throw error;
+
+        } finally {
+          client.release();
+        }
+
+      } catch (error) {
+        console.log(
+          "WALLET REAL DEPOSIT ERROR:",
+          error.message
+        );
 
         res.end(JSON.stringify({
           ok: false,
-          message: "Telegram wallet could not be created"
+          message: "Could not process TRC20 deposit"
         }));
-
-        return;
       }
 
-      const walletResult = await client.query(`
-        SELECT
-          w.id,
-          w.balance,
-          w.locked_balance,
-          w.currency
-        FROM wallets w
-        WHERE w.user_id = $1
-        FOR UPDATE
-      `, [walletData.user.id]);
-
-      if (walletResult.rows.length === 0) {
-        await client.query("ROLLBACK");
-
-        res.end(JSON.stringify({
-          ok: false,
-          message: "Wallet not found"
-        }));
-
-        return;
-      }
-
-      const row = walletResult.rows[0];
-      const oldBalance = Number(row.balance);
-      const newBalance = oldBalance + amount;
-
-      await client.query(`
-        UPDATE wallets
-        SET balance = $1,
-            updated_at = NOW()
-        WHERE id = $2
-      `, [newBalance, row.id]);
-
-      await client.query(`
-        INSERT INTO wallet_transactions
-          (user_id, type, amount, currency, status, description)
-        SELECT
-          u.id, 'DEPOSIT', $1, $2, 'COMPLETED', 'Test deposit'
-        FROM users u
-        WHERE u.telegram_id = $3
-      `, [amount, row.currency, 999999999]);
-
-      await client.query("COMMIT");
-
-      const lockedBalance = Number(row.locked_balance);
-
-      res.end(JSON.stringify({
-        ok: true,
-        action: "DEPOSIT",
-        amount: amount,
-        balance: Number(newBalance.toFixed(2)),
-        availableBalance: Number(
-          (newBalance - lockedBalance).toFixed(2)
-        ),
-        lockedBalance: Number(lockedBalance.toFixed(2)),
-        currency: row.currency
-      }));
-
-    } catch (error) {
-      await client.query("ROLLBACK");
-      throw error;
-    } finally {
-      client.release();
+      return;
     }
-
-  } catch (error) {
-    console.log("WALLET DEPOSIT DATABASE ERROR:", error.message);
-
-    res.end(JSON.stringify({
-      ok: false,
-      message: "Database error"
-    }));
-  }
-
-  return;
-}
 
     // =========================
     // WALLET WITHDRAW - TRC20
@@ -4461,6 +5208,110 @@ if (confirmUrl.pathname === "/wallet-confirm-withdraw") {
     }
 
     // =========================
+    // ADMIN DEPOSIT ADDRESS SET
+    // =========================
+    if (
+      req.method === "POST" &&
+      req.url === "/admin/wallet-deposit-address"
+    ) {
+      const adminUser = getTelegramUserFromRequest(req);
+
+      if (!adminUser) {
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Telegram authentication required"
+        }));
+        return;
+      }
+
+      if (!isAdminTelegramUser(adminUser)) {
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Admin access required"
+        }));
+        return;
+      }
+
+      try {
+        const body = await readJsonBody(req);
+
+        const userId = Number(body.userId);
+        const address = String(body.address || "").trim();
+        const network =
+          String(body.network || "TRC20").trim().toUpperCase();
+
+        if (!Number.isInteger(userId) || userId <= 0) {
+          res.end(JSON.stringify({
+            ok: false,
+            message: "Invalid userId"
+          }));
+          return;
+        }
+
+        if (network !== "TRC20") {
+          res.end(JSON.stringify({
+            ok: false,
+            message: "Only TRC20 network is supported"
+          }));
+          return;
+        }
+
+        if (!/^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(address)) {
+          res.end(JSON.stringify({
+            ok: false,
+            message: "Invalid TRC20 deposit address"
+          }));
+          return;
+        }
+
+        const result = await pool.query(
+          "UPDATE wallets SET deposit_tron_address = $1, deposit_tron_network = 'TRC20', deposit_enabled = TRUE, updated_at = NOW() WHERE user_id = $2 RETURNING user_id, deposit_tron_address, deposit_tron_network, deposit_enabled",
+          [address, userId]
+        );
+
+        if (result.rows.length === 0) {
+          res.end(JSON.stringify({
+            ok: false,
+            message: "Wallet not found"
+          }));
+          return;
+        }
+
+        const wallet = result.rows[0];
+
+        res.end(JSON.stringify({
+          ok: true,
+          action: "SET_DEPOSIT_ADDRESS",
+          userId: wallet.user_id,
+          address: wallet.deposit_tron_address,
+          network: wallet.deposit_tron_network,
+          depositEnabled: wallet.deposit_enabled
+        }));
+
+      } catch (error) {
+        if (error && error.code === "23505") {
+          res.end(JSON.stringify({
+            ok: false,
+            message: "Deposit address is already assigned to another wallet"
+          }));
+          return;
+        }
+
+        console.log(
+          "ADMIN DEPOSIT ADDRESS ERROR:",
+          error.message
+        );
+
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Could not set deposit address"
+        }));
+      }
+
+      return;
+    }
+
+    // =========================
     // ADMIN PENDING WITHDRAWALS
     // =========================
     if (
@@ -5203,9 +6054,76 @@ if (confirmUrl.pathname === "/wallet-confirm-withdraw") {
             return;
           }
 
+
+          const updatedWithdrawal = updateResult.rows[0];
+
+          const blockchainInsert = await client.query(`
+            INSERT INTO blockchain_withdrawals (
+              wallet_transaction_id,
+              network,
+              asset,
+              destination_address,
+              amount,
+              status,
+              created_at,
+              updated_at
+            )
+            VALUES (
+              $1,
+              'TRC20',
+              'USDT',
+              $2,
+              $3::numeric,
+              'CREATED',
+              NOW(),
+              NOW()
+            )
+            ON CONFLICT (wallet_transaction_id)
+            DO NOTHING
+            RETURNING id, status
+          `, [
+            updatedWithdrawal.id,
+            updatedWithdrawal.destination_address,
+            String(updatedWithdrawal.amount)
+          ]);
+
+          let blockchainLedger;
+
+          if (blockchainInsert.rows.length > 0) {
+            blockchainLedger = blockchainInsert.rows[0];
+          } else {
+            const existingBlockchain = await client.query(`
+              SELECT id, status
+              FROM blockchain_withdrawals
+              WHERE wallet_transaction_id = $1
+              FOR UPDATE
+            `, [updatedWithdrawal.id]);
+
+            if (existingBlockchain.rows.length === 0) {
+              await client.query("ROLLBACK");
+              res.end(JSON.stringify({
+                ok: false,
+                message: "Blockchain withdrawal record could not be created"
+              }));
+              return;
+            }
+
+            blockchainLedger = existingBlockchain.rows[0];
+
+            if (blockchainLedger.status !== "CREATED") {
+              await client.query("ROLLBACK");
+              res.end(JSON.stringify({
+                ok: false,
+                message: "Blockchain withdrawal already progressed",
+                status: blockchainLedger.status
+              }));
+              return;
+            }
+          }
+
           await client.query("COMMIT");
 
-          const updated = updateResult.rows[0];
+                    const updated = updateResult.rows[0];
 
           res.end(JSON.stringify({
             ok: true,
@@ -5216,7 +6134,9 @@ if (confirmUrl.pathname === "/wallet-confirm-withdraw") {
             currency: updated.currency,
             destinationAddress: updated.destination_address,
             status: updated.status,
-            processedAt: updated.processed_at
+            processedAt: updated.processed_at,
+            blockchainWithdrawalId: blockchainLedger?.id || null,
+            blockchainStatus: blockchainLedger?.status || null
           }));
 
         } catch (error) {
@@ -5303,6 +6223,214 @@ if (confirmUrl.pathname === "/wallet-confirm-withdraw") {
         res.end(JSON.stringify({
           ok: false,
           message: "Could not load processing withdrawals"
+        }));
+      }
+
+      return;
+    }
+
+
+    // =========================
+    // ADMIN BUILD TRC20 WITHDRAWAL
+    // =========================
+    if (
+      req.method === "POST" &&
+      req.url === "/admin/wallet-withdraw-build"
+    ) {
+      const adminUser = getTelegramUserFromRequest(req);
+
+      if (!adminUser) {
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Telegram authentication required"
+        }));
+        return;
+      }
+
+      if (!isAdminTelegramUser(adminUser)) {
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Admin access required"
+        }));
+        return;
+      }
+
+      try {
+        const body = await readJsonBody(req);
+        const transactionId = Number(body.transactionId);
+
+        if (
+          !Number.isInteger(transactionId) ||
+          transactionId <= 0
+        ) {
+          res.end(JSON.stringify({
+            ok: false,
+            message: "Invalid transactionId"
+          }));
+          return;
+        }
+
+        const client = await pool.connect();
+
+        try {
+          await client.query("BEGIN");
+
+          const result = await client.query(`
+            SELECT
+              bw.id AS blockchain_withdrawal_id,
+              bw.wallet_transaction_id,
+              bw.status AS blockchain_status,
+              bw.destination_address,
+              bw.amount,
+              wt.user_id,
+              wt.currency,
+              wt.status AS withdrawal_status
+            FROM blockchain_withdrawals bw
+            JOIN wallet_transactions wt
+              ON wt.id = bw.wallet_transaction_id
+            WHERE bw.wallet_transaction_id = $1
+              AND wt.type = 'WITHDRAW'
+            FOR UPDATE
+          `, [transactionId]);
+
+          if (result.rows.length === 0) {
+            await client.query("ROLLBACK");
+
+            res.end(JSON.stringify({
+              ok: false,
+              message: "Blockchain withdrawal record not found"
+            }));
+            return;
+          }
+
+          const withdrawal = result.rows[0];
+
+          if (withdrawal.withdrawal_status !== "PROCESSING") {
+            await client.query("ROLLBACK");
+
+            res.end(JSON.stringify({
+              ok: false,
+              message: "Withdrawal must be PROCESSING before build",
+              status: withdrawal.withdrawal_status
+            }));
+            return;
+          }
+
+          if (withdrawal.blockchain_status !== "CREATED") {
+            await client.query("ROLLBACK");
+
+            res.end(JSON.stringify({
+              ok: false,
+              message: "Blockchain withdrawal is not in CREATED state",
+              status: withdrawal.blockchain_status
+            }));
+            return;
+          }
+
+          const buildResult =
+            await buildTrc20UsdtWithdrawalTransaction({
+              destinationAddress:
+                String(withdrawal.destination_address).trim(),
+              amount:
+                String(withdrawal.amount)
+            });
+
+          if (
+            !buildResult ||
+            !buildResult.rawDataHex ||
+            !buildResult.txID
+          ) {
+            throw new Error(
+              "TRON withdrawal builder returned incomplete transaction"
+            );
+          }
+
+          const updateResult = await client.query(`
+            UPDATE blockchain_withdrawals
+            SET
+              raw_amount = $1::numeric,
+              raw_data_hex = $2,
+              tx_id = $3,
+              status = 'BUILT',
+              built_at = NOW(),
+              updated_at = NOW(),
+              error_message = NULL
+            WHERE id = $4
+              AND status = 'CREATED'
+            RETURNING
+              id,
+              wallet_transaction_id,
+              raw_amount,
+              raw_data_hex,
+              tx_id,
+              status,
+              built_at
+          `, [
+            buildResult.rawAmount,
+            buildResult.rawDataHex,
+            buildResult.txID,
+            withdrawal.blockchain_withdrawal_id
+          ]);
+
+          if (updateResult.rows.length === 0) {
+            await client.query("ROLLBACK");
+
+            res.end(JSON.stringify({
+              ok: false,
+              message: "Blockchain withdrawal state changed during build"
+            }));
+            return;
+          }
+
+          await client.query("COMMIT");
+
+          const built = updateResult.rows[0];
+
+          res.end(JSON.stringify({
+            ok: true,
+            action: "BUILD_TRON_WITHDRAWAL",
+            transactionId:
+              built.wallet_transaction_id,
+            blockchainWithdrawalId:
+              built.id,
+            status:
+              built.status,
+            txID:
+              built.tx_id,
+            rawAmount:
+              String(built.raw_amount),
+            rawDataHex:
+              built.raw_data_hex,
+            feeLimit:
+              buildResult.feeLimit,
+            energyUsed:
+              buildResult.energyUsed,
+            energyFee:
+              buildResult.energyFee,
+            builtAt:
+              built.built_at
+          }));
+
+        } catch (error) {
+          try {
+            await client.query("ROLLBACK");
+          } catch {}
+
+          throw error;
+
+        } finally {
+          client.release();
+        }
+
+      } catch (error) {
+        console.log(
+          "ADMIN BUILD TRON WITHDRAWAL ERROR:",
+          error.message
+        );
+
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Could not build TRON withdrawal transaction"
         }));
       }
 
