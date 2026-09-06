@@ -3,6 +3,12 @@ const http = require("http");
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const WALLEX_API_KEY = process.env.WALLEX_API_KEY;
 const REAL_TRADE_ENABLED = process.env.REAL_TRADE_ENABLED === "true";
+console.log("TRON ENV RUNTIME STATUS:", {
+  TRON_FULLNODE: Boolean(String(process.env.TRON_FULLNODE || "").trim()),
+  TRON_USDT_CONTRACT: Boolean(String(process.env.TRON_USDT_CONTRACT || "").trim()),
+  TRON_TREASURY_ADDRESS: Boolean(String(process.env.TRON_TREASURY_ADDRESS || "").trim())
+});
+
 const crypto = require("crypto");
 const { Pool } = require("pg");
 const { TronWeb } = require("tronweb");
