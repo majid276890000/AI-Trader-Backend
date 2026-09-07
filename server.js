@@ -1063,7 +1063,7 @@ async function buildTrc20UsdtWithdrawalTransaction({
 
   const tronWeb =
     new TronWeb({
-      fullHost
+      fullHost: fullNode
     });
 
   const transactionResult =
