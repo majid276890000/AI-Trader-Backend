@@ -4,7 +4,7 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const WALLEX_API_KEY = process.env.WALLEX_API_KEY;
 const REAL_TRADE_ENABLED = process.env.REAL_TRADE_ENABLED === "true";
 console.log("TRON ENV RUNTIME STATUS:", {
-  TRON_FULLNODE: Boolean(String(process.env.TRON_FULLNODE || "").trim()),
+  TRON_FULLNODE: Boolean(String(process.env.TRON_FULLNODE || "https://api.trongrid.io").trim()),
   TRON_USDT_CONTRACT: Boolean(String(process.env.TRON_USDT_CONTRACT || "").trim()),
   TRON_TREASURY_ADDRESS: Boolean(String(process.env.TRON_TREASURY_ADDRESS || "").trim())
 });
@@ -832,7 +832,7 @@ async function estimateTrc20TransferFeeLimit({
   rawAmount
 }) {
   const fullNode =
-    String(process.env.TRON_FULLNODE || "").trim();
+    String(process.env.TRON_FULLNODE || "https://api.trongrid.io").trim();
 
   const contract =
     String(process.env.TRON_USDT_CONTRACT || "").trim();
@@ -997,7 +997,7 @@ async function buildTrc20UsdtWithdrawalTransaction({
   amount
 }) {
   const fullNode =
-    String(process.env.TRON_FULLNODE || "").trim();
+    String(process.env.TRON_FULLNODE || "https://api.trongrid.io").trim();
 
   const contract =
     String(process.env.TRON_USDT_CONTRACT || "").trim();
@@ -1020,20 +1020,32 @@ async function buildTrc20UsdtWithdrawalTransaction({
   const amountString =
     String(amount || "").trim();
 
-  if (!/^\d+(?:\.\d{1,6})?$/.test(amountString)) {
+  if (!/^\d+(?:\.\d+)?$/.test(amountString)) {
     throw new Error(
-      "Withdrawal amount must have at most 6 decimal places"
+      "Withdrawal amount must be a valid decimal number"
     );
   }
 
   const [wholePart, decimalPart = ""] =
     amountString.split(".");
 
+  if (decimalPart.length > 6 && /[^0]/.test(decimalPart.slice(6))) {
+    throw new Error(
+      "Withdrawal amount must have at most 6 decimal places"
+    );
+  }
+
+  const normalizedAmountString =
+    wholePart + (decimalPart ? "." + decimalPart.slice(0, 6) : "");
+
+  const [normalizedWholePart, normalizedDecimalPart = ""] =
+    normalizedAmountString.split(".");
+
   const rawAmount =
     (
-      BigInt(wholePart) * 1_000_000n +
+      BigInt(normalizedWholePart) * 1_000_000n +
       BigInt(
-        (decimalPart + "000000").slice(0, 6)
+        (normalizedDecimalPart + "000000").slice(0, 6)
       )
     ).toString();
 
