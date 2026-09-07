@@ -5429,10 +5429,14 @@ if (confirmUrl.pathname === "/wallet-confirm-withdraw") {
             wt.created_at,
             wt.processed_at,
             wt.blockchain_txid,
-            wt.error_message
+            wt.error_message,
+            bw.status AS blockchain_status,
+            bw.tx_id
           FROM wallet_transactions wt
           JOIN users u
             ON u.id = wt.user_id
+          LEFT JOIN blockchain_withdrawals bw
+            ON bw.wallet_transaction_id = wt.id
           WHERE wt.type = 'WITHDRAW'
             AND wt.status = 'PENDING'
           ORDER BY wt.created_at ASC
