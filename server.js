@@ -1112,12 +1112,72 @@ async function buildTrc20UsdtWithdrawalTransaction({
 }
 
 // =========================
-// SECURE TRON SIGNER INTERFACE
+// SECURE TRON SIGNER
 // =========================
-// Signing is intentionally disabled until a secure external signer
-// (KMS/HSM/custody service) is connected.
-async function signTronTransaction() {
-  throw new Error("TRON transaction signing is disabled: secure signer not configured");
+async function signTronTransaction(transaction) {
+  const fullNode =
+    String(process.env.TRON_FULLNODE || "https://api.trongrid.io").trim();
+
+  const treasuryAddress =
+    String(process.env.TRON_TREASURY_ADDRESS || "").trim();
+
+  const privateKey =
+    String(process.env.TRON_PRIVATE_KEY || "").trim();
+
+  if (!treasuryAddress || !privateKey) {
+    throw new Error(
+      "TRON signer configuration is incomplete"
+    );
+  }
+
+  const tronWeb =
+    new TronWeb({
+      fullHost: fullNode
+    });
+
+  const derivedAddress =
+    tronWeb.address.fromPrivateKey(privateKey);
+
+  if (!derivedAddress) {
+    throw new Error(
+      "TRON private key could not derive an address"
+    );
+  }
+
+  if (derivedAddress !== treasuryAddress) {
+    throw new Error(
+      "TRON private key does not match treasury address"
+    );
+  }
+
+  if (
+    !transaction ||
+    !transaction.raw_data ||
+    !transaction.raw_data_hex
+  ) {
+    throw new Error(
+      "Invalid TRON transaction for signing"
+    );
+  }
+
+  const signedTransaction =
+    await tronWeb.trx.sign(
+      transaction,
+      privateKey
+    );
+
+  if (
+    !signedTransaction ||
+    !signedTransaction.signature ||
+    !Array.isArray(signedTransaction.signature) ||
+    signedTransaction.signature.length === 0
+  ) {
+    throw new Error(
+      "TRON transaction signing failed"
+    );
+  }
+
+  return signedTransaction;
 }
 
 // =========================
@@ -6450,6 +6510,193 @@ if (confirmUrl.pathname === "/wallet-confirm-withdraw") {
           ok: false,
           message: "Could not build TRON withdrawal transaction"
         }));
+      }
+
+      return;
+    }
+
+    // =========================
+    // ADMIN SIGN TRC20 WITHDRAWAL
+    // =========================
+    if (
+      req.method === "POST" &&
+      req.url === "/admin/wallet-withdraw-sign"
+    ) {
+      const adminUser = getTelegramUserFromRequest(req);
+
+      if (!adminUser) {
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Telegram authentication required"
+        }));
+        return;
+      }
+
+      if (!isAdminTelegramUser(adminUser)) {
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Admin access required"
+        }));
+        return;
+      }
+
+      let client;
+
+      try {
+        const body = await readJsonBody(req);
+        const transactionId = Number(body.transactionId);
+
+        if (
+          !Number.isInteger(transactionId) ||
+          transactionId <= 0
+        ) {
+          res.end(JSON.stringify({
+            ok: false,
+            message: "Invalid transactionId"
+          }));
+          return;
+        }
+
+        client = await pool.connect();
+        await client.query("BEGIN");
+
+        const result = await client.query(`
+          SELECT
+            bw.id AS blockchain_withdrawal_id,
+            bw.wallet_transaction_id,
+            bw.status AS blockchain_status,
+            bw.raw_data_hex,
+            bw.tx_id,
+            bw.destination_address,
+            bw.amount,
+            wt.user_id,
+            wt.currency,
+            wt.status AS withdrawal_status
+          FROM blockchain_withdrawals bw
+          JOIN wallet_transactions wt
+            ON wt.id = bw.wallet_transaction_id
+          WHERE bw.wallet_transaction_id = $1
+            AND wt.type = 'WITHDRAW'
+          FOR UPDATE
+        `, [transactionId]);
+
+        if (result.rows.length === 0) {
+          await client.query("ROLLBACK");
+          res.end(JSON.stringify({
+            ok: false,
+            message: "Blockchain withdrawal record not found"
+          }));
+          return;
+        }
+
+        const withdrawal = result.rows[0];
+
+        if (withdrawal.withdrawal_status !== "PROCESSING") {
+          await client.query("ROLLBACK");
+          res.end(JSON.stringify({
+            ok: false,
+            message: "Withdrawal must be PROCESSING before signing",
+            status: withdrawal.withdrawal_status
+          }));
+          return;
+        }
+
+        if (withdrawal.blockchain_status !== "BUILT") {
+          await client.query("ROLLBACK");
+          res.end(JSON.stringify({
+            ok: false,
+            message: "Blockchain withdrawal is not in BUILT state",
+            status: withdrawal.blockchain_status
+          }));
+          return;
+        }
+
+        if (
+          !withdrawal.raw_data_hex ||
+          !withdrawal.tx_id
+        ) {
+          throw new Error(
+            "Built TRON transaction data is incomplete"
+          );
+        }
+
+        const transaction = {
+          txID: withdrawal.tx_id,
+          raw_data_hex: withdrawal.raw_data_hex
+        };
+
+        const signedTransaction =
+          await signTronTransaction(transaction);
+
+        const updateResult = await client.query(`
+          UPDATE blockchain_withdrawals
+          SET
+            status = 'SIGNED',
+            signed_at = NOW(),
+            updated_at = NOW(),
+            error_message = NULL
+          WHERE id = $1
+            AND status = 'BUILT'
+          RETURNING
+            id,
+            wallet_transaction_id,
+            status,
+            tx_id,
+            signed_at
+        `, [withdrawal.blockchain_withdrawal_id]);
+
+        if (updateResult.rows.length === 0) {
+          await client.query("ROLLBACK");
+          res.end(JSON.stringify({
+            ok: false,
+            message: "Blockchain withdrawal state changed during signing"
+          }));
+          return;
+        }
+
+        await client.query("COMMIT");
+
+        const signed = updateResult.rows[0];
+
+        res.end(JSON.stringify({
+          ok: true,
+          action: "SIGN_TRON_WITHDRAWAL",
+          transactionId:
+            signed.wallet_transaction_id,
+          blockchainWithdrawalId:
+            signed.id,
+          status:
+            signed.status,
+          txID:
+            signed.tx_id,
+          signatureCount:
+            Array.isArray(signedTransaction.signature)
+              ? signedTransaction.signature.length
+              : 0,
+          signedAt:
+            signed.signed_at
+        }));
+
+      } catch (error) {
+        if (client) {
+          try {
+            await client.query("ROLLBACK");
+          } catch {}
+        }
+
+        console.log(
+          "ADMIN SIGN TRON WITHDRAWAL ERROR:",
+          error.message
+        );
+
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Could not sign TRON withdrawal transaction"
+        }));
+      } finally {
+        if (client) {
+          client.release();
+        }
       }
 
       return;
