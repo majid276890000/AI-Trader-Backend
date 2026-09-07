@@ -6703,6 +6703,90 @@ if (confirmUrl.pathname === "/wallet-confirm-withdraw") {
     }
 
     // =========================
+    // ADMIN VERIFY TRON SIGNER
+    // =========================
+    if (
+      req.method === "POST" &&
+      req.url === "/admin/wallet-withdraw-signer-verify"
+    ) {
+      const adminUser = getTelegramUserFromRequest(req);
+
+      if (!adminUser) {
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Telegram authentication required"
+        }));
+        return;
+      }
+
+      if (!isAdminTelegramUser(adminUser)) {
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Admin access required"
+        }));
+        return;
+      }
+
+      try {
+        const fullNode =
+          String(process.env.TRON_FULLNODE || "https://api.trongrid.io").trim();
+
+        const treasuryAddress =
+          String(process.env.TRON_TREASURY_ADDRESS || "").trim();
+
+        const privateKey =
+          String(process.env.TRON_PRIVATE_KEY || "").trim();
+
+        if (!treasuryAddress || !privateKey) {
+          res.end(JSON.stringify({
+            ok: false,
+            message: "TRON signer configuration is incomplete"
+          }));
+          return;
+        }
+
+        const tronWeb =
+          new TronWeb({
+            fullHost: fullNode
+          });
+
+        const derivedAddress =
+          tronWeb.address.fromPrivateKey(privateKey);
+
+        if (!derivedAddress) {
+          res.end(JSON.stringify({
+            ok: false,
+            message: "TRON private key could not derive an address"
+          }));
+          return;
+        }
+
+        const matches =
+          derivedAddress === treasuryAddress;
+
+        res.end(JSON.stringify({
+          ok: matches,
+          signerConfigured: true,
+          treasuryAddressConfigured: true,
+          addressMatch: matches
+        }));
+
+      } catch (error) {
+        console.log(
+          "ADMIN VERIFY TRON SIGNER ERROR:",
+          error.message
+        );
+
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Could not verify TRON signer"
+        }));
+      }
+
+      return;
+    }
+
+    // =========================
     // DEFAULT
     // =========================
     res.end(JSON.stringify({
