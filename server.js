@@ -1153,7 +1153,8 @@ async function signTronTransaction(transaction) {
   if (
     !transaction ||
     !transaction.raw_data ||
-    !transaction.raw_data_hex
+    !transaction.raw_data_hex ||
+    !transaction.txID
   ) {
     throw new Error(
       "Invalid TRON transaction for signing"
@@ -1168,6 +1169,7 @@ async function signTronTransaction(transaction) {
 
   if (
     !signedTransaction ||
+    signedTransaction.txID !== transaction.txID ||
     !signedTransaction.signature ||
     !Array.isArray(signedTransaction.signature) ||
     signedTransaction.signature.length === 0
@@ -6620,9 +6622,25 @@ if (confirmUrl.pathname === "/wallet-confirm-withdraw") {
           );
         }
 
+        const tronWeb =
+          new TronWeb({
+            fullHost:
+              String(
+                process.env.TRON_FULLNODE ||
+                "https://api.trongrid.io"
+              ).trim()
+          });
+
+        const rawData =
+          tronWeb.utils.deserializeTx.deserializeTransaction(
+            "TriggerSmartContract",
+            withdrawal.raw_data_hex
+          );
+
         const transaction = {
           txID: withdrawal.tx_id,
-          raw_data_hex: withdrawal.raw_data_hex
+          raw_data_hex: withdrawal.raw_data_hex,
+          raw_data: rawData
         };
 
         const signedTransaction =
@@ -6632,10 +6650,11 @@ if (confirmUrl.pathname === "/wallet-confirm-withdraw") {
           UPDATE blockchain_withdrawals
           SET
             status = 'SIGNED',
+            signed_transaction = $1::jsonb,
             signed_at = NOW(),
             updated_at = NOW(),
             error_message = NULL
-          WHERE id = $1
+          WHERE id = $2
             AND status = 'BUILT'
           RETURNING
             id,
@@ -6643,7 +6662,10 @@ if (confirmUrl.pathname === "/wallet-confirm-withdraw") {
             status,
             tx_id,
             signed_at
-        `, [withdrawal.blockchain_withdrawal_id]);
+        `, [
+          JSON.stringify(signedTransaction),
+          withdrawal.blockchain_withdrawal_id
+        ]);
 
         if (updateResult.rows.length === 0) {
           await client.query("ROLLBACK");
