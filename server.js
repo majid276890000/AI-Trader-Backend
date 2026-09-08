@@ -6733,6 +6733,229 @@ if (confirmUrl.pathname === "/wallet-confirm-withdraw") {
     }
 
     // =========================
+    // ADMIN BROADCAST TRC20 WITHDRAWAL
+    // =========================
+    if (
+      req.method === "POST" &&
+      req.url === "/admin/wallet-withdraw-broadcast"
+    ) {
+      const adminUser = getTelegramUserFromRequest(req);
+
+      if (!adminUser) {
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Telegram authentication required"
+        }));
+        return;
+      }
+
+      if (!isAdminTelegramUser(adminUser)) {
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Admin access required"
+        }));
+        return;
+      }
+
+      let client;
+
+      try {
+        const body = await readJsonBody(req);
+        const transactionId = Number(body.transactionId);
+
+        if (
+          !Number.isInteger(transactionId) ||
+          transactionId <= 0
+        ) {
+          res.end(JSON.stringify({
+            ok: false,
+            message: "Invalid transactionId"
+          }));
+          return;
+        }
+
+        client = await pool.connect();
+        await client.query("BEGIN");
+
+        const result = await client.query(`
+          SELECT
+            bw.id AS blockchain_withdrawal_id,
+            bw.wallet_transaction_id,
+            bw.status AS blockchain_status,
+            bw.tx_id,
+            bw.signed_transaction,
+            wt.status AS withdrawal_status
+          FROM blockchain_withdrawals bw
+          JOIN wallet_transactions wt
+            ON wt.id = bw.wallet_transaction_id
+          WHERE bw.wallet_transaction_id = $1
+            AND wt.type = 'WITHDRAW'
+          FOR UPDATE
+        `, [transactionId]);
+
+        if (result.rows.length === 0) {
+          await client.query("ROLLBACK");
+
+          res.end(JSON.stringify({
+            ok: false,
+            message: "Blockchain withdrawal record not found"
+          }));
+          return;
+        }
+
+        const withdrawal = result.rows[0];
+
+        if (withdrawal.withdrawal_status !== "PROCESSING") {
+          await client.query("ROLLBACK");
+
+          res.end(JSON.stringify({
+            ok: false,
+            message: "Withdrawal must be PROCESSING before broadcast",
+            status: withdrawal.withdrawal_status
+          }));
+          return;
+        }
+
+        if (withdrawal.blockchain_status !== "SIGNED") {
+          await client.query("ROLLBACK");
+
+          res.end(JSON.stringify({
+            ok: false,
+            message: "Blockchain withdrawal is not in SIGNED state",
+            status: withdrawal.blockchain_status
+          }));
+          return;
+        }
+
+        if (
+          !withdrawal.signed_transaction ||
+          !withdrawal.tx_id
+        ) {
+          throw new Error(
+            "Signed TRON transaction data is incomplete"
+          );
+        }
+
+        const signedTransaction =
+          typeof withdrawal.signed_transaction === "string"
+            ? JSON.parse(withdrawal.signed_transaction)
+            : withdrawal.signed_transaction;
+
+        if (
+          signedTransaction.txID !== withdrawal.tx_id ||
+          !Array.isArray(signedTransaction.signature) ||
+          signedTransaction.signature.length === 0
+        ) {
+          throw new Error(
+            "Stored TRON signed transaction is invalid"
+          );
+        }
+
+        const tronWeb =
+          new TronWeb({
+            fullHost:
+              String(
+                process.env.TRON_FULLNODE ||
+                "https://api.trongrid.io"
+              ).trim()
+          });
+
+        const broadcastResult =
+          await tronWeb.trx.sendRawTransaction(
+            signedTransaction
+          );
+
+        if (!broadcastResult || broadcastResult.result !== true) {
+          const errorMessage =
+            broadcastResult?.message
+              ? Buffer.from(
+                  broadcastResult.message,
+                  "hex"
+                ).toString("utf8")
+              : "TRON broadcast failed";
+
+          await client.query(`
+            UPDATE blockchain_withdrawals
+            SET
+              error_message = $1,
+              updated_at = NOW()
+            WHERE id = $2
+          `, [
+            errorMessage,
+            withdrawal.blockchain_withdrawal_id
+          ]);
+
+          await client.query("COMMIT");
+
+          res.end(JSON.stringify({
+            ok: false,
+            action: "BROADCAST_TRON_WITHDRAWAL",
+            transactionId,
+            blockchainWithdrawalId:
+              withdrawal.blockchain_withdrawal_id,
+            txID: withdrawal.tx_id,
+            status: withdrawal.blockchain_status,
+            broadcasted: false,
+            message: errorMessage
+          }));
+          return;
+        }
+
+        await client.query(`
+          UPDATE blockchain_withdrawals
+          SET
+            status = 'BROADCASTED',
+            blockchain_txid = $1,
+            broadcast_at = NOW(),
+            updated_at = NOW(),
+            error_message = NULL
+          WHERE id = $2
+            AND status = 'SIGNED'
+        `, [
+          withdrawal.tx_id,
+          withdrawal.blockchain_withdrawal_id
+        ]);
+
+        await client.query("COMMIT");
+
+        res.end(JSON.stringify({
+          ok: true,
+          action: "BROADCAST_TRON_WITHDRAWAL",
+          transactionId,
+          blockchainWithdrawalId:
+            withdrawal.blockchain_withdrawal_id,
+          txID: withdrawal.tx_id,
+          status: "BROADCASTED",
+          broadcasted: true,
+          broadcastResult
+        }));
+
+      } catch (error) {
+        if (client) {
+          try {
+            await client.query("ROLLBACK");
+          } catch {}
+        }
+
+        console.log(
+          "ADMIN BROADCAST TRON WITHDRAWAL ERROR:",
+          error.message
+        );
+
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Could not broadcast TRON withdrawal transaction"
+        }));
+      } finally {
+        if (client) {
+          client.release();
+        }
+      }
+
+      return;
+    }
+
+    // =========================
     // ADMIN VERIFY TRON SIGNER
     // =========================
     if (
