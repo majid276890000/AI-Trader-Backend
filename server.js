@@ -42,6 +42,14 @@ function validateTelegramInitData(initData) {
 
     if (calculatedHash !== hash) return null;
 
+    const authDate = Number(params.get("auth_date"));
+    const now = Math.floor(Date.now() / 1000);
+    const maxAge = 24 * 60 * 60;
+
+    if (!Number.isFinite(authDate) || authDate <= 0 || now - authDate > maxAge || authDate - now > 60) {
+      return null;
+    }
+
     const user = params.get("user");
     if (!user) return null;
 
