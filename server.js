@@ -1097,12 +1097,35 @@ async function buildTrc20UsdtWithdrawalTransaction({
     );
   }
 
+  // Refresh TRON transaction timing so it does not expire
+  // before the separate sign/broadcast steps are completed.
+  const transaction = transactionResult.transaction;
+  const now = Date.now();
+
+  if (!transaction.raw_data) {
+    throw new Error("TRON transaction raw_data is missing");
+  }
+
+  transaction.raw_data.timestamp = now;
+  transaction.raw_data.expiration = now + (2 * 60 * 60 * 1000);
+
+  const transactionPb =
+    tronWeb.utils.transaction.txJsonToPb(transaction);
+
+  const refreshedTxID =
+    tronWeb.utils.transaction.txPbToTxID(transactionPb);
+
+  const refreshedRawDataHex =
+    tronWeb.utils.transaction.txPbToRawDataHex(transactionPb);
+
+  transaction.txID = refreshedTxID;
+  transaction.raw_data_hex = refreshedRawDataHex;
+
   return {
-    transaction: transactionResult.transaction,
-    txID:
-      transactionResult.transaction.txID || null,
-    rawDataHex:
-      transactionResult.transaction.raw_data_hex || null,
+    transaction,
+    txID: refreshedTxID,
+    rawDataHex: refreshedRawDataHex,
+    expiration: transaction.raw_data.expiration,
     feeLimit: feeInfo.feeLimit,
     energyUsed: feeInfo.energyUsed,
     energyFee: feeInfo.energyFee,
@@ -6651,6 +6674,18 @@ if (confirmUrl.pathname === "/wallet-confirm-withdraw") {
           raw_data: rawData
         };
 
+        const expiration =
+          Number(rawData?.expiration);
+
+        if (
+          !Number.isFinite(expiration) ||
+          expiration <= Date.now()
+        ) {
+          throw new Error(
+            "TRON withdrawal transaction has expired and must be rebuilt"
+          );
+        }
+
         const signedTransaction =
           await signTronTransaction(transaction);
 
@@ -6848,6 +6883,18 @@ if (confirmUrl.pathname === "/wallet-confirm-withdraw") {
         ) {
           throw new Error(
             "Stored TRON signed transaction is invalid"
+          );
+        }
+
+        const expiration =
+          Number(signedTransaction?.raw_data?.expiration);
+
+        if (
+          !Number.isFinite(expiration) ||
+          expiration <= Date.now()
+        ) {
+          throw new Error(
+            "TRON signed transaction has expired and must be rebuilt and signed again"
           );
         }
 
