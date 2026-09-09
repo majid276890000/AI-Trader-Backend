@@ -2648,6 +2648,18 @@ const server = http.createServer(
     );
 
     if (req.method === "GET" && req.url === "/wallex-trading-balance") {
+      const adminUser = getTelegramUserFromRequest(req);
+      if (!adminUser) {
+        res.writeHead(401, {"Content-Type": "application/json; charset=utf-8"});
+        res.end(JSON.stringify({ok: false, message: "Telegram authentication required"}));
+        return;
+      }
+      if (!isAdminTelegramUser(adminUser)) {
+        res.writeHead(403, {"Content-Type": "application/json; charset=utf-8"});
+        res.end(JSON.stringify({ok: false, message: "Admin access required"}));
+        return;
+      }
+
       try {
         const balance = await getWallexTradingBalance();
 
@@ -2677,6 +2689,18 @@ const server = http.createServer(
     }
 
     if (req.method === "GET" && req.url === "/wallex-balance") {
+      const adminUser = getTelegramUserFromRequest(req);
+      if (!adminUser) {
+        res.writeHead(401, {"Content-Type": "application/json; charset=utf-8"});
+        res.end(JSON.stringify({ok: false, message: "Telegram authentication required"}));
+        return;
+      }
+      if (!isAdminTelegramUser(adminUser)) {
+        res.writeHead(403, {"Content-Type": "application/json; charset=utf-8"});
+        res.end(JSON.stringify({ok: false, message: "Admin access required"}));
+        return;
+      }
+
       try {
         const balance = await getWallexBalance();
 
