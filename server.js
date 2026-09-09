@@ -1113,7 +1113,9 @@ async function buildTrc20UsdtWithdrawalTransaction({
     tronWeb.utils.transaction.txJsonToPb(transaction);
 
   const refreshedTxID =
-    tronWeb.utils.transaction.txPbToTxID(transactionPb);
+    tronWeb.utils.transaction
+      .txPbToTxID(transactionPb)
+      .replace(/^0x/, "");
 
   const refreshedRawDataHex =
     tronWeb.utils.transaction.txPbToRawDataHex(transactionPb);
