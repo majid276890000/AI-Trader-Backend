@@ -2878,7 +2878,12 @@ const server = http.createServer(
     // START
     // =========================
     if (req.url === "/start") {
-      botStatus = "active";
+      const telegramUser = getTelegramUserFromRequest(req);
+      if (!telegramUser) {
+        res.writeHead(401, {"Content-Type": "application/json; charset=utf-8"});
+        res.end(JSON.stringify({ok: false, message: "Telegram authentication required"}));
+        return;
+      }
 
       res.end(JSON.stringify({
         message: "Bot started",
@@ -2892,7 +2897,12 @@ const server = http.createServer(
     // STOP
     // =========================
     if (req.url === "/stop") {
-      botStatus = "stopped";
+      const telegramUser = getTelegramUserFromRequest(req);
+      if (!telegramUser) {
+        res.writeHead(401, {"Content-Type": "application/json; charset=utf-8"});
+        res.end(JSON.stringify({ok: false, message: "Telegram authentication required"}));
+        return;
+      }
 
       res.end(JSON.stringify({
         message: "Bot stopped",
