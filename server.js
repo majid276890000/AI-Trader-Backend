@@ -4618,9 +4618,28 @@ if (confirmUrl.pathname === "/wallet-confirm-withdraw") {
             LIMIT 50
           `, [telegramId]);
 
+        const todayProfitResult =
+          await client.query(`
+            SELECT COALESCE(SUM(t.profit), 0) AS today_profit
+            FROM trades t
+            JOIN users u
+              ON u.id = t.user_id
+            WHERE u.telegram_id = $1
+              AND t.status = 'CLOSED'
+              AND t.closed_at IS NOT NULL
+              AND (
+                (t.closed_at AT TIME ZONE 'GMT')
+                AT TIME ZONE 'Asia/Tehran'
+              )::date =
+                  (NOW() AT TIME ZONE 'Asia/Tehran')::date
+          `, [telegramId]);
+
         res.end(JSON.stringify({
           ok: true,
-          trades: result.rows
+          trades: result.rows,
+          todayProfit: Number(
+            todayProfitResult.rows[0].today_profit || 0
+          )
         }));
 
       } catch (error) {
