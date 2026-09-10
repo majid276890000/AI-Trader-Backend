@@ -191,7 +191,6 @@ async function initDatabase() {
       ADD COLUMN IF NOT EXISTS auto_trade_enabled BOOLEAN DEFAULT FALSE;
 
       ALTER TABLE wallets
-      ADD COLUMN IF NOT EXISTS trade_mode VARCHAR(20) DEFAULT 'LOW';
 
       ALTER TABLE wallets
       ADD COLUMN IF NOT EXISTS tron_network VARCHAR(20) DEFAULT 'TRC20';
@@ -1311,7 +1310,8 @@ async function getAutoTradeUsers() {
       SELECT
         u.id AS user_id,
         u.telegram_id,
-        w.trading_mode
+                w.trading_mode,
+                w.trading_capital
       FROM users u
       INNER JOIN wallets w
         ON w.user_id = u.id
@@ -2529,10 +2529,10 @@ async function runUserAutoTrade() {
           );
 
         // Maximum automatic trade size:
-        // 2 USDT for the current first live-trade stage.
+        // Maximum automatic trade size is controlled by the user trading capital.
         const tradeAmount =
           Math.min(
-            2,
+            Number(user.trading_capital || 0),
             wallexAvailableUSDT
           );
 
@@ -2798,6 +2798,217 @@ const server = http.createServer(
 
       } finally {
 
+        if (client) {
+          client.release();
+        }
+      }
+
+      return;
+    }
+
+    // =========================
+    // TRADING MODE
+    // =========================
+    if (req.url.startsWith("/trading-mode")) {
+
+      const modeUrl =
+        new URL(
+          req.url,
+          `http://${req.headers.host || "localhost"}`
+        );
+
+      const telegramUser =
+        getTelegramUserFromRequest(req);
+
+      if (!telegramUser) {
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Telegram authentication required"
+        }));
+        return;
+      }
+
+      const requestedMode =
+        String(modeUrl.searchParams.get("mode") || "")
+          .toUpperCase();
+
+      const allowedModes =
+        ["LOW", "MEDIUM", "HIGH"];
+
+      let client;
+
+      try {
+        client = await pool.connect();
+
+        const userResult =
+          await client.query(`
+            SELECT id
+            FROM users
+            WHERE telegram_id = $1
+          `, [String(telegramUser.id)]);
+
+        if (userResult.rows.length === 0) {
+          res.end(JSON.stringify({
+            ok: false,
+            message: "User not found"
+          }));
+          return;
+        }
+
+        const userId =
+          userResult.rows[0].id;
+
+        if (requestedMode) {
+          if (!allowedModes.includes(requestedMode)) {
+            res.end(JSON.stringify({
+              ok: false,
+              message: "Invalid trading mode"
+            }));
+            return;
+          }
+
+          await client.query(`
+            UPDATE wallets
+            SET trading_mode = $1,
+                updated_at = NOW()
+            WHERE user_id = $2
+          `, [requestedMode, userId]);
+        }
+
+        const result =
+          await client.query(`
+            SELECT trading_mode
+            FROM wallets
+            WHERE user_id = $1
+          `, [userId]);
+
+        res.end(JSON.stringify({
+          ok: true,
+          mode:
+            result.rows.length > 0
+              ? result.rows[0].trading_mode
+              : "LOW"
+        }));
+
+      } catch (error) {
+        console.log(
+          "TRADING MODE DATABASE ERROR:",
+          error.message
+        );
+
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Trading mode database error"
+        }));
+
+      } finally {
+        if (client) {
+          client.release();
+        }
+      }
+
+      return;
+    }
+
+    // =========================
+    // TRADING CAPITAL
+    // =========================
+    if (req.url.startsWith("/trading-capital")) {
+
+      const capitalUrl =
+        new URL(
+          req.url,
+          `http://${req.headers.host || "localhost"}`
+        );
+
+      const telegramUser =
+        getTelegramUserFromRequest(req);
+
+      if (!telegramUser) {
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Telegram authentication required"
+        }));
+        return;
+      }
+
+      const requestedCapital =
+        capitalUrl.searchParams.get("amount");
+
+      let client;
+
+      try {
+        client = await pool.connect();
+
+        const userResult =
+          await client.query(`
+            SELECT id
+            FROM users
+            WHERE telegram_id = $1
+          `, [String(telegramUser.id)]);
+
+        if (userResult.rows.length === 0) {
+          res.end(JSON.stringify({
+            ok: false,
+            message: "User not found"
+          }));
+          return;
+        }
+
+        const userId =
+          userResult.rows[0].id;
+
+        if (requestedCapital !== null) {
+          const capital =
+            Number(requestedCapital);
+
+          if (
+            !Number.isFinite(capital) ||
+            capital < 2 ||
+            capital > 1000
+          ) {
+            res.end(JSON.stringify({
+              ok: false,
+              message: "Trading capital must be between 2 and 1000 USDT"
+            }));
+            return;
+          }
+
+          await client.query(`
+            UPDATE wallets
+            SET trading_capital = $1,
+                updated_at = NOW()
+            WHERE user_id = $2
+          `, [capital, userId]);
+        }
+
+        const result =
+          await client.query(`
+            SELECT trading_capital
+            FROM wallets
+            WHERE user_id = $1
+          `, [userId]);
+
+        res.end(JSON.stringify({
+          ok: true,
+          amount:
+            result.rows.length > 0
+              ? Number(result.rows[0].trading_capital)
+              : 2
+        }));
+
+      } catch (error) {
+        console.log(
+          "TRADING CAPITAL DATABASE ERROR:",
+          error.message
+        );
+
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Trading capital database error"
+        }));
+
+      } finally {
         if (client) {
           client.release();
         }
