@@ -2780,11 +2780,50 @@ const server = http.createServer(
     // STATUS
     // =========================
     if (req.url === "/status") {
-      res.end(JSON.stringify({
-        bot: botStatus,
-        balance: balance,
-        settings: settings
-      }));
+      const telegramUser = getTelegramUserFromRequest(req);
+
+      if (!telegramUser) {
+        res.writeHead(401, {"Content-Type": "application/json; charset=utf-8"});
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Telegram authentication required"
+        }));
+        return;
+      }
+
+      try {
+        const walletData = await getOrCreateTelegramWallet(telegramUser);
+        const row = walletData?.wallet;
+
+        if (!row) {
+          res.writeHead(404, {"Content-Type": "application/json; charset=utf-8"});
+          res.end(JSON.stringify({
+            ok: false,
+            message: "Wallet not found"
+          }));
+          return;
+        }
+
+        const balance = Number(row.balance ?? 0);
+        const lockedBalance = Number(row.locked_balance ?? 0);
+        const availableBalance = balance - lockedBalance;
+
+        res.end(JSON.stringify({
+          ok: true,
+          bot: botStatus,
+          balance: Number(balance.toFixed(2)),
+          availableBalance: Number(availableBalance.toFixed(2)),
+          lockedBalance: Number(lockedBalance.toFixed(2)),
+          settings: settings
+        }));
+      } catch (error) {
+        console.log("STATUS WALLET ERROR:", error.message);
+        res.writeHead(500, {"Content-Type": "application/json; charset=utf-8"});
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Database error"
+        }));
+      }
 
       return;
     }
