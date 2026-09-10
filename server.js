@@ -3917,6 +3917,18 @@ const server = http.createServer(
       req.url === "/wallet-withdraw-fiat"
     ) {
 
+      const telegramUser =
+          getTelegramUserFromRequest(req);
+
+        if (!telegramUser) {
+          res.end(JSON.stringify({
+            ok: false,
+            message: "Telegram authentication required"
+          }));
+          return;
+        }
+
+        
       try {
 
         const body = await readJsonBody(req);
@@ -3955,17 +3967,6 @@ const server = http.createServer(
           res.end(JSON.stringify({
             ok: false,
             message: "Invalid IBAN"
-          }));
-          return;
-        }
-
-        const telegramUser =
-          getTelegramUserFromRequest(req);
-
-        if (!telegramUser) {
-          res.end(JSON.stringify({
-            ok: false,
-            message: "Telegram authentication required"
           }));
           return;
         }
