@@ -1310,7 +1310,8 @@ async function getAutoTradeUsers() {
     await pool.query(`
       SELECT
         u.id AS user_id,
-        u.telegram_id
+        u.telegram_id,
+        w.trading_mode
       FROM users u
       INNER JOIN wallets w
         ON w.user_id = u.id
@@ -2462,13 +2463,27 @@ async function runUserAutoTrade() {
             const changePercent =
               ((price - buyPrice) / buyPrice) * 100;
 
+            const tradingMode = String(
+              user.trading_mode || "LOW"
+            ).toUpperCase();
+
+            const sellProfitTarget =
+              tradingMode === "HIGH" ? 1 : 0.5;
+
+            const sellLossLimit =
+              tradingMode === "LOW"
+                ? -0.5
+                : tradingMode === "HIGH"
+                  ? -2
+                  : -1;
+
             console.log(
-              `AUTO TRADE CHECK: user=${user.user_id} change=${changePercent.toFixed(4)}%`
+              `AUTO TRADE CHECK: user=${user.user_id} mode=${tradingMode} change=${changePercent.toFixed(4)}% profitTarget=${sellProfitTarget}% lossLimit=${sellLossLimit}%`
             );
 
             if (
-              changePercent >= 0.5 ||
-              changePercent <= -1
+              changePercent >= sellProfitTarget ||
+              changePercent <= sellLossLimit
             ) {
               const sellResult =
                 await executeAutoTradeSell(
@@ -2487,7 +2502,19 @@ async function runUserAutoTrade() {
         // =========================
         // AUTO BUY
         // =========================
+        const tradingMode = String(user.trading_mode || "LOW").toUpperCase();
+
         if (analysis.signal !== "CHECK_BUY") {
+          continue;
+        }
+
+        const requiredConfidence =
+          tradingMode === "LOW" ? 80 : 70;
+
+        if (Number(analysis.confidence || 0) < requiredConfidence) {
+          console.log(
+            `AUTO TRADE BUY SKIP: user=${user.user_id} mode=${tradingMode} confidence=${analysis.confidence} required=${requiredConfidence}`
+          );
           continue;
         }
 
