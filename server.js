@@ -4298,6 +4298,17 @@ if (confirmUrl.pathname === "/wallet-confirm-withdraw") {
     // =========================
     if (req.url.startsWith("/trade-buy")) {
 
+      const telegramUser =
+        getTelegramUserFromRequest(req);
+
+      if (!telegramUser) {
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Telegram authentication required"
+        }));
+        return;
+      }
+
       const tradeUrl = new URL(
         req.url,
         `http://${req.headers.host || "localhost"}`
@@ -4311,17 +4322,6 @@ if (confirmUrl.pathname === "/wallet-confirm-withdraw") {
         res.end(JSON.stringify({
           ok: false,
           message: "Invalid trade amount"
-        }));
-        return;
-      }
-
-      const telegramUser =
-        getTelegramUserFromRequest(req);
-
-      if (!telegramUser) {
-        res.end(JSON.stringify({
-          ok: false,
-          message: "Telegram authentication required"
         }));
         return;
       }
