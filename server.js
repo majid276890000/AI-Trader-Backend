@@ -191,6 +191,9 @@ async function initDatabase() {
       ADD COLUMN IF NOT EXISTS auto_trade_enabled BOOLEAN DEFAULT FALSE;
 
       ALTER TABLE wallets
+      ADD COLUMN IF NOT EXISTS trade_mode VARCHAR(20) DEFAULT 'LOW';
+
+      ALTER TABLE wallets
       ADD COLUMN IF NOT EXISTS tron_network VARCHAR(20) DEFAULT 'TRC20';
 
       ALTER TABLE wallets
