@@ -2563,9 +2563,9 @@ async function runUserAutoTrade() {
 
   } catch (error) {
 
-    console.log(
+    console.error(
       "AUTO TRADE RUNNER ERROR:",
-      error.message
+      error?.stack || error?.message || String(error) || JSON.stringify(error)
     );
   }
 }
