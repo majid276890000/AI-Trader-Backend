@@ -15,3 +15,6 @@ server.js.safe
 server_backup_*
 
 node_modules/
+
+# Local database backup - never commit
+ai-trader-neon-backup.sql

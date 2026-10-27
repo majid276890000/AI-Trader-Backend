@@ -7145,11 +7145,26 @@ if (confirmUrl.pathname === "/wallet-confirm-withdraw") {
 );
 
 // =========================
-// Auto Trade Cycle
+// Auto Trade Cycle (overlap protected)
 // =========================
-setInterval(() => {
-  console.log("AUTO TRADE TIMER TICK");
-  runUserAutoTrade();
+let autoTradeCycleRunning = false;
+
+setInterval(async () => {
+  if (autoTradeCycleRunning) {
+    console.log("AUTO TRADE SKIP: previous cycle still running");
+    return;
+  }
+
+  autoTradeCycleRunning = true;
+
+  try {
+    console.log("AUTO TRADE TIMER TICK");
+    await runUserAutoTrade();
+  } catch (error) {
+    console.log("AUTO TRADE CYCLE ERROR:", error.message);
+  } finally {
+    autoTradeCycleRunning = false;
+  }
 }, 15000);
 
 // =========================
