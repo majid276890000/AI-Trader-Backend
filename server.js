@@ -822,7 +822,7 @@ async function verifyTronUsdtDeposit({
   };
 }
 
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
 let botStatus = "stopped";
 
