@@ -1,6 +1,14 @@
 require("dotenv").config();
 const http = require("http");
 const BOT_TOKEN = process.env.BOT_TOKEN;
+
+const START_TELEGRAM_BOT = process.env.START_TELEGRAM_BOT !== "false";
+if (START_TELEGRAM_BOT && BOT_TOKEN) {
+  require("./bot");
+} else {
+  console.log("Telegram Bot not started:", !BOT_TOKEN ? "BOT_TOKEN missing" : "disabled by environment");
+}
+
 const WALLEX_API_KEY = process.env.WALLEX_API_KEY;
 const REAL_TRADE_ENABLED = process.env.REAL_TRADE_ENABLED === "true";
 console.log("TRON ENV RUNTIME STATUS:", {
