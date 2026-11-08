@@ -182,6 +182,23 @@ async function initDatabase() {
         created_at TIMESTAMP DEFAULT NOW()
       );
 
+      CREATE TABLE IF NOT EXISTS tronlink_auth_challenges (
+        action_id UUID PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        purpose VARCHAR(10) NOT NULL CHECK (purpose IN ('LOGIN', 'SIGN')),
+        expected_address TEXT,
+        challenge_message TEXT,
+        verified_address TEXT,
+        status VARCHAR(15) NOT NULL DEFAULT 'PENDING',
+        callback_code INTEGER,
+        created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+        expires_at TIMESTAMP NOT NULL,
+        consumed_at TIMESTAMP
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_tronlink_challenges_user
+      ON tronlink_auth_challenges(user_id, created_at DESC);
+
       CREATE TABLE IF NOT EXISTS wallets (
         id SERIAL PRIMARY KEY,
         user_id INTEGER NOT NULL REFERENCES users(id),
@@ -194,6 +211,18 @@ async function initDatabase() {
 
       ALTER TABLE wallets
       ADD COLUMN IF NOT EXISTS tron_address TEXT;
+
+      ALTER TABLE wallets
+      ADD COLUMN IF NOT EXISTS tron_address_status VARCHAR(20) NOT NULL DEFAULT 'PENDING';
+
+      ALTER TABLE wallets
+      ADD COLUMN IF NOT EXISTS tron_address_updated_at TIMESTAMP;
+
+      ALTER TABLE wallets
+      ADD COLUMN IF NOT EXISTS tron_address_approved_at TIMESTAMP;
+
+      ALTER TABLE wallets
+      ADD COLUMN IF NOT EXISTS tron_address_approved_by BIGINT;
 
       ALTER TABLE wallets
       ADD COLUMN IF NOT EXISTS auto_trade_enabled BOOLEAN DEFAULT FALSE;
@@ -260,10 +289,11 @@ async function initDatabase() {
     console.log("DATABASE TABLES OK");
   } catch (error) {
     console.log("DATABASE INIT ERROR:", error);
+    throw error;
   }
 }
 
-initDatabase();
+const databaseReady = initDatabase();
 // =========================
 // Read JSON Request Body
 // =========================
@@ -2591,7 +2621,7 @@ const server = http.createServer(
 
     res.setHeader(
       "Access-Control-Allow-Methods",
-      "GET, OPTIONS"
+      "GET, POST, OPTIONS"
     );
 
     res.setHeader(
@@ -2688,6 +2718,230 @@ const server = http.createServer(
 
     // =========================
     // AUTO TRADE CONTROL
+    if (req.url.split("?")[0] === "/tronlink-callback") {
+      let client;
+
+      try {
+        let payload = {};
+
+        if (req.method === "POST") {
+          const type = String(req.headers["content-type"] || "");
+          if (!type.includes("application/json")) {
+            res.writeHead(415, {"Content-Type":"application/json"});
+            res.end(JSON.stringify({ok:false, message:"JSON required"}));
+            return;
+          }
+          payload = await readJsonBody(req);
+        } else if (req.method === "GET") {
+          const parsed = new URL(req.url, "http://localhost");
+          payload = Object.fromEntries(parsed.searchParams.entries());
+        } else {
+          res.writeHead(405, {"Content-Type":"application/json"});
+          res.end(JSON.stringify({ok:false, message:"Method not allowed"}));
+          return;
+        }
+
+        const actionId = String(payload.actionId || "");
+        if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(actionId)) {
+          res.writeHead(400, {"Content-Type":"application/json"});
+          res.end(JSON.stringify({ok:false, message:"Invalid actionId"}));
+          return;
+        }
+
+        const callbackCode = Number(payload.code);
+        if (!Number.isInteger(callbackCode)) {
+          res.writeHead(400, {"Content-Type":"application/json"});
+          res.end(JSON.stringify({ok:false, message:"Invalid callback code"}));
+          return;
+        }
+
+        client = await pool.connect();
+        await client.query("BEGIN");
+
+        const found = await client.query(
+          `SELECT action_id, user_id, purpose, expected_address,
+                  challenge_message, status, expires_at, consumed_at
+           FROM tronlink_auth_challenges
+           WHERE action_id = $1
+           FOR UPDATE`,
+          [actionId]
+        );
+
+        if (!found.rows.length) {
+          await client.query("ROLLBACK");
+          res.writeHead(404, {"Content-Type":"application/json"});
+          res.end(JSON.stringify({ok:false, message:"Challenge not found"}));
+          return;
+        }
+
+        const challenge = found.rows[0];
+
+        if (challenge.status !== "PENDING" || challenge.consumed_at) {
+          await client.query("ROLLBACK");
+          res.writeHead(409, {"Content-Type":"application/json"});
+          res.end(JSON.stringify({ok:false, message:"Challenge already used"}));
+          return;
+        }
+
+        if (new Date(challenge.expires_at) <= new Date()) {
+          await client.query(
+            `UPDATE tronlink_auth_challenges
+             SET status = 'EXPIRED', consumed_at = NOW()
+             WHERE action_id = $1`,
+            [actionId]
+          );
+          await client.query("COMMIT");
+          res.writeHead(410, {"Content-Type":"application/json"});
+          res.end(JSON.stringify({ok:false, message:"Challenge expired"}));
+          return;
+        }
+
+        if (callbackCode !== 0) {
+          const failedStatus = callbackCode === 300 ? "CANCELLED" : "FAILED";
+          await client.query(
+            `UPDATE tronlink_auth_challenges
+             SET status = $2, callback_code = $3, consumed_at = NOW()
+             WHERE action_id = $1`,
+            [actionId, failedStatus, callbackCode]
+          );
+          await client.query("COMMIT");
+          res.writeHead(200, {"Content-Type":"application/json"});
+          res.end(JSON.stringify({ok:true, status:failedStatus}));
+          return;
+        }
+
+        if (challenge.purpose === "LOGIN") {
+          const address = String(payload.address || "");
+
+          if (!/^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(address)) {
+            await client.query("ROLLBACK");
+            res.writeHead(400, {"Content-Type":"application/json"});
+            res.end(JSON.stringify({ok:false, message:"Invalid TRON address"}));
+            return;
+          }
+
+          await client.query(
+            `UPDATE tronlink_auth_challenges
+             SET verified_address = $2, callback_code = 0,
+                 status = 'LOGIN_OK', consumed_at = NOW()
+             WHERE action_id = $1`,
+            [actionId, address]
+          );
+
+          await client.query("COMMIT");
+          res.writeHead(200, {"Content-Type":"application/json"});
+          res.end(JSON.stringify({ok:true, status:"LOGIN_OK"}));
+          return;
+        }
+
+        if (challenge.purpose !== "SIGN" ||
+            !challenge.expected_address ||
+            !challenge.challenge_message ||
+            typeof payload.signedData !== "string" ||
+            !payload.signedData.trim()) {
+          await client.query("ROLLBACK");
+          res.writeHead(400, {"Content-Type":"application/json"});
+          res.end(JSON.stringify({ok:false, message:"Invalid signature callback"}));
+          return;
+        }
+
+        const verifier = new TronWeb({
+          fullHost: "https://api.trongrid.io"
+        });
+
+        const signerAddress = await verifier.trx.verifyMessageV2(
+          challenge.challenge_message,
+          payload.signedData
+        );
+
+        if (String(signerAddress) !== String(challenge.expected_address)) {
+          await client.query(
+            `UPDATE tronlink_auth_challenges
+             SET status = 'FAILED', callback_code = 0, consumed_at = NOW()
+             WHERE action_id = $1`,
+            [actionId]
+          );
+          await client.query("COMMIT");
+          res.writeHead(400, {"Content-Type":"application/json"});
+          res.end(JSON.stringify({ok:false, message:"Signature address mismatch"}));
+          return;
+        }
+
+        const userResult = await client.query(
+          `SELECT telegram_id FROM users WHERE id = $1`,
+          [challenge.user_id]
+        );
+
+        if (!userResult.rows.length) {
+          throw new Error("Challenge user not found");
+        }
+
+        const adminAutoApprove = isAdminTelegramUser({
+          id: String(userResult.rows[0].telegram_id)
+        });
+        const addressStatus = adminAutoApprove ? "APPROVED" : "PENDING";
+
+        const walletResult = await client.query(
+          `UPDATE wallets
+           SET tron_address = $1,
+               tron_network = 'TRC20',
+               tron_address_status = $2,
+               tron_address_updated_at = NOW(),
+               tron_address_approved_at =
+                 CASE WHEN $2 = 'APPROVED' THEN NOW() ELSE NULL END,
+               tron_address_approved_by =
+                 CASE WHEN $2 = 'APPROVED' THEN $3::BIGINT ELSE NULL END,
+               updated_at = NOW()
+           WHERE user_id = $4
+           RETURNING id`,
+          [
+            signerAddress,
+            addressStatus,
+            adminAutoApprove ? String(userResult.rows[0].telegram_id) : null,
+            challenge.user_id
+          ]
+        );
+
+        if (!walletResult.rows.length) {
+          throw new Error("Wallet not found for verified user");
+        }
+
+        await client.query(
+          `UPDATE tronlink_auth_challenges
+           SET verified_address = $2, callback_code = 0,
+               status = 'VERIFIED', consumed_at = NOW()
+           WHERE action_id = $1`,
+          [actionId, signerAddress]
+        );
+
+        await client.query("COMMIT");
+        res.writeHead(200, {"Content-Type":"application/json"});
+        res.end(JSON.stringify({
+          ok:true,
+          status:"VERIFIED",
+          addressStatus
+        }));
+      } catch (error) {
+        if (client) {
+          try { await client.query("ROLLBACK"); } catch (_) {}
+        }
+        console.error("TRONLINK CALLBACK ERROR:", error.message);
+        if (!res.writableEnded) {
+          res.writeHead(400, {"Content-Type":"application/json"});
+          res.end(JSON.stringify({ok:false, message:"Callback verification failed"}));
+        }
+      } finally {
+        if (client) client.release();
+      }
+
+      return;
+    }
+
+    // =========================
+    // AUTO TRADE CONTROL
+    // =========================
+    // AUTO TRADE CONTROL
+
     // =========================
     if (req.url.startsWith("/auto-trade")) {
 
@@ -3466,6 +3720,241 @@ const server = http.createServer(
     }
 
     // =========================
+    // SECURE TRONLINK LOGIN CHALLENGE
+    if (
+      req.method === "POST" &&
+      req.url === "/tronlink-auth/start"
+    ) {
+      const telegramUser = getTelegramUserFromRequest(req);
+
+      if (!telegramUser) {
+        res.writeHead(401, {"Content-Type":"application/json; charset=utf-8"});
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Telegram authentication required"
+        }));
+        return;
+      }
+
+      try {
+        const account = await getOrCreateTelegramWallet(telegramUser);
+
+        if (!account || !account.user || !account.user.id) {
+          throw new Error("Telegram wallet unavailable");
+        }
+
+        const actionId = crypto.randomUUID();
+
+        await pool.query(
+          `INSERT INTO tronlink_auth_challenges
+           (action_id, user_id, purpose, status, expires_at)
+           VALUES ($1, $2, 'LOGIN', 'PENDING', NOW() + INTERVAL '5 minutes')`,
+          [actionId, account.user.id]
+        );
+
+        res.writeHead(200, {
+          "Content-Type": "application/json; charset=utf-8",
+          "Cache-Control": "no-store"
+        });
+
+        res.end(JSON.stringify({
+          ok: true,
+          actionId,
+          action: "login",
+          callbackUrl: "https://ai-trader-backend-xfyg.onrender.com/tronlink-callback",
+          url: "https://majid276890000.github.io/ai-trader-miniapp/",
+          protocol: "TronLink",
+          version: "1.0",
+          chainId: "0x2b6653dc",
+          expiresIn: 300
+        }));
+      } catch (error) {
+        console.error("TRONLINK LOGIN START ERROR:", error.message);
+        res.writeHead(500, {"Content-Type":"application/json; charset=utf-8"});
+        res.end(JSON.stringify({
+          ok: false,
+          message: "Could not start TronLink authentication"
+        }));
+      }
+
+      return;
+    }
+
+
+    // SECURE TRONLINK AUTH STATUS
+    if (
+      req.method === "GET" &&
+      req.url.split("?")[0] === "/tronlink-auth/status"
+    ) {
+      const telegramUser = getTelegramUserFromRequest(req);
+
+      if (!telegramUser) {
+        res.writeHead(401, {"Content-Type":"application/json; charset=utf-8"});
+        res.end(JSON.stringify({ok:false, message:"Telegram authentication required"}));
+        return;
+      }
+
+      try {
+        const parsed = new URL(req.url, "http://localhost");
+        const actionId = parsed.searchParams.get("actionId") || "";
+
+        if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(actionId)) {
+          res.writeHead(400, {"Content-Type":"application/json; charset=utf-8"});
+          res.end(JSON.stringify({ok:false, message:"Invalid actionId"}));
+          return;
+        }
+
+        const account = await getOrCreateTelegramWallet(telegramUser);
+        const result = await pool.query(
+          `SELECT purpose, status, verified_address, callback_code, expires_at
+           FROM tronlink_auth_challenges
+           WHERE action_id = $1 AND user_id = $2
+           LIMIT 1`,
+          [actionId, account.user.id]
+        );
+
+        if (!result.rows.length) {
+          res.writeHead(404, {"Content-Type":"application/json; charset=utf-8"});
+          res.end(JSON.stringify({ok:false, message:"Authentication request not found"}));
+          return;
+        }
+
+        const challenge = result.rows[0];
+
+        if (challenge.status === "PENDING" && new Date(challenge.expires_at) <= new Date()) {
+          await pool.query(
+            `UPDATE tronlink_auth_challenges
+             SET status = 'EXPIRED'
+             WHERE action_id = $1 AND user_id = $2 AND status = 'PENDING'`,
+            [actionId, account.user.id]
+          );
+          challenge.status = "EXPIRED";
+        }
+
+        res.writeHead(200, {
+          "Content-Type":"application/json; charset=utf-8",
+          "Cache-Control":"no-store"
+        });
+        res.end(JSON.stringify({
+          ok: true,
+          purpose: challenge.purpose,
+          status: challenge.status,
+          address: ["LOGIN_OK", "VERIFIED"].includes(challenge.status)
+            ? challenge.verified_address
+            : null,
+          callbackCode: challenge.callback_code
+        }));
+      } catch (error) {
+        console.error("TRONLINK AUTH STATUS ERROR:", error.message);
+        res.writeHead(500, {"Content-Type":"application/json; charset=utf-8"});
+        res.end(JSON.stringify({ok:false, message:"Could not check authentication status"}));
+      }
+
+      return;
+    }
+
+    // SECURE TRONLINK SIGN CHALLENGE
+    if (
+      req.method === "POST" &&
+      req.url === "/tronlink-auth/sign"
+    ) {
+      const telegramUser = getTelegramUserFromRequest(req);
+
+      if (!telegramUser) {
+        res.writeHead(401, {"Content-Type":"application/json; charset=utf-8"});
+        res.end(JSON.stringify({ok:false, message:"Telegram authentication required"}));
+        return;
+      }
+
+      try {
+        const body = await readJsonBody(req);
+        const loginActionId = String(body.actionId || "");
+
+        if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(loginActionId)) {
+          res.writeHead(400, {"Content-Type":"application/json; charset=utf-8"});
+          res.end(JSON.stringify({ok:false, message:"Invalid login actionId"}));
+          return;
+        }
+
+        const account = await getOrCreateTelegramWallet(telegramUser);
+        if (!account || !account.user || !account.user.id) {
+          throw new Error("Telegram wallet unavailable");
+        }
+
+        const loginResult = await pool.query(
+          `UPDATE tronlink_auth_challenges
+           SET status = 'LOGIN_USED'
+           WHERE action_id = $1
+             AND user_id = $2
+             AND purpose = 'LOGIN'
+             AND status = 'LOGIN_OK'
+             AND verified_address IS NOT NULL
+             AND consumed_at IS NOT NULL
+             AND expires_at > NOW()
+           RETURNING verified_address`,
+          [loginActionId, account.user.id]
+        );
+
+        if (!loginResult.rows.length) {
+          res.writeHead(409, {"Content-Type":"application/json; charset=utf-8"});
+          res.end(JSON.stringify({ok:false, message:"Login challenge is invalid or already used"}));
+          return;
+        }
+
+        const address = String(loginResult.rows[0].verified_address);
+        if (!/^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(address)) {
+          throw new Error("Invalid login address");
+        }
+
+        const actionId = crypto.randomUUID();
+        const nonce = crypto.randomBytes(32).toString("hex");
+        const domain = "majid276890000.github.io";
+        const message = [
+          "AI-Trader Wallet Ownership Verification",
+          "Domain: " + domain,
+          "Address: " + address,
+          "Telegram User: " + String(telegramUser.id),
+          "Nonce: " + nonce,
+          "Purpose: Verify TRC20 withdrawal address ownership",
+          "Expires: " + new Date(Date.now() + 5 * 60 * 1000).toISOString()
+        ].join("\n");
+
+        await pool.query(
+          `INSERT INTO tronlink_auth_challenges
+           (action_id, user_id, purpose, expected_address,
+            challenge_message, status, expires_at)
+           VALUES ($1, $2, 'SIGN', $3, $4, 'PENDING',
+                   NOW() + INTERVAL '5 minutes')`,
+          [actionId, account.user.id, address, message]
+        );
+
+        res.writeHead(200, {
+          "Content-Type":"application/json; charset=utf-8",
+          "Cache-Control":"no-store"
+        });
+        res.end(JSON.stringify({
+          ok:true,
+          action:"sign",
+          actionId,
+          loginAddress:address,
+          signType:"signStr",
+          message,
+          callbackUrl:"https://ai-trader-backend-xfyg.onrender.com/tronlink-callback",
+          url:"https://majid276890000.github.io/ai-trader-miniapp/",
+          protocol:"TronLink",
+          version:"1.0",
+          chainId:"0x2b6653dc",
+          expiresIn:300
+        }));
+      } catch (error) {
+        console.error("TRONLINK SIGN START ERROR:", error.message);
+        res.writeHead(500, {"Content-Type":"application/json; charset=utf-8"});
+        res.end(JSON.stringify({ok:false, message:"Could not start signature verification"}));
+      }
+
+      return;
+    }
+
     // WALLET TRON ADDRESS
     // =========================
     if (
@@ -7177,11 +7666,13 @@ setInterval(async () => {
 // =========================
 // Start Server
 // =========================
-server.listen(
-  PORT,
-  () => {
-    console.log(
-      `AI-Trader Backend running on port ${PORT}`
-    );
-  }
-);
+databaseReady
+  .then(() => {
+    server.listen(PORT, () => {
+      console.log(`AI-Trader Backend running on port ${PORT}`);
+    });
+  })
+  .catch((error) => {
+    console.error("SERVER START BLOCKED: DATABASE INIT FAILED", error);
+    process.exit(1);
+  });

@@ -15,5 +15,8 @@
     "node-telegram-bot-api": "^0.66.0",
     "pg": "^8.23.0",
     "tronweb": "^6.5.0"
+  },
+  "overrides": {
+    "axios": "1.21.0"
   }
 }
