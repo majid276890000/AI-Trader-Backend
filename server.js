@@ -289,10 +289,11 @@ async function initDatabase() {
     console.log("DATABASE TABLES OK");
   } catch (error) {
     console.log("DATABASE INIT ERROR:", error);
+    throw error;
   }
 }
 
-initDatabase();
+const databaseReady = initDatabase();
 // =========================
 // Read JSON Request Body
 // =========================
@@ -7665,11 +7666,13 @@ setInterval(async () => {
 // =========================
 // Start Server
 // =========================
-server.listen(
-  PORT,
-  () => {
-    console.log(
-      `AI-Trader Backend running on port ${PORT}`
-    );
-  }
-);
+databaseReady
+  .then(() => {
+    server.listen(PORT, () => {
+      console.log(`AI-Trader Backend running on port ${PORT}`);
+    });
+  })
+  .catch((error) => {
+    console.error("SERVER START BLOCKED: DATABASE INIT FAILED", error);
+    process.exit(1);
+  });
