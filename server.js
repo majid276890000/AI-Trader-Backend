@@ -2853,6 +2853,10 @@ const server = http.createServer(
           challenge.challenge_message,
           payload.signedData
         );
+        console.log("TRON SIGN DEBUG:", {
+          signerAddress: String(signerAddress),
+          expectedAddress: String(challenge.expected_address)
+        });
 
         if (String(signerAddress) !== String(challenge.expected_address)) {
           await client.query(
