@@ -2845,6 +2845,15 @@ const server = http.createServer(
           return;
         }
 
+        console.log("TRON MESSAGE DEBUG:", {
+          callbackMessageType: typeof payload.message,
+          callbackMessageLength: typeof payload.message === "string" ? payload.message.length : null,
+          challengeMessageLength: challenge.challenge_message.length,
+          exactMatch: typeof payload.message === "string"
+            ? payload.message === challenge.challenge_message
+            : false
+        });
+
         const verifier = new TronWeb({
           fullHost: "https://api.trongrid.io"
         });
