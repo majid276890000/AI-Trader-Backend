@@ -2854,9 +2854,13 @@ const server = http.createServer(
           payload.signedData
         );
         console.log("TRON SIGN DEBUG:", {
-          signerAddress: String(signerAddress),
-          expectedAddress: String(challenge.expected_address)
-        });
+        signerAddress: String(signerAddress),
+        expectedAddress: String(challenge.expected_address),
+        payloadKeys: Object.keys(payload),
+        signedDataType: typeof payload.signedData,
+        signedDataLength: typeof payload.signedData === "string" ? payload.signedData.length : null,
+        callbackAddress: payload.address || payload.loginAddress || null
+      });
 
         if (String(signerAddress) !== String(challenge.expected_address)) {
           await client.query(
