@@ -2829,6 +2829,18 @@ const server = http.createServer(
             [actionId, address]
           );
 
+          await client.query(
+            `UPDATE wallets
+             SET tron_address = $1,
+                 tron_network = 'TRC20',
+                 tron_address_status = 'PENDING',
+                 tron_address_approved_at = NULL,
+                 tron_address_approved_by = NULL,
+                 tron_address_updated_at = NOW()
+             WHERE user_id = $2`,
+            [address, challenge.user_id]
+          );
+
           await client.query("COMMIT");
           res.writeHead(200, {"Content-Type":"application/json"});
           res.end(JSON.stringify({ok:true, status:"LOGIN_OK"}));
