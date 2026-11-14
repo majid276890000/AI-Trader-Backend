@@ -2864,6 +2864,7 @@ const server = http.createServer(
           payload.signedData
         );
         console.log("TRON SIGN DEBUG:", {
+        callbackActionId: actionId,
         signerAddress: String(signerAddress),
         expectedAddress: String(challenge.expected_address),
         payloadKeys: Object.keys(payload),
