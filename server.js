@@ -2812,6 +2812,7 @@ const server = http.createServer(
 
         if (challenge.purpose === "LOGIN") {
           const address = String(payload.address || "");
+          console.log("TRON LOGIN DEBUG:", { actionId, address });
 
           if (!/^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(address)) {
             await client.query("ROLLBACK");
@@ -3919,6 +3920,7 @@ const server = http.createServer(
         }
 
         const address = String(loginResult.rows[0].verified_address);
+        console.log("TRON SIGN CHALLENGE DEBUG:", { loginActionId, actionId, expectedAddress: address });
         if (!/^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(address)) {
           throw new Error("Invalid login address");
         }
