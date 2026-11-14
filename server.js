@@ -3920,7 +3920,7 @@ const server = http.createServer(
         }
 
         const address = String(loginResult.rows[0].verified_address);
-        console.log("TRON SIGN CHALLENGE DEBUG:", { loginActionId, actionId, expectedAddress: address });
+        console.log("TRON SIGN CHALLENGE DEBUG:", { loginActionId, expectedAddress: address });
         if (!/^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(address)) {
           throw new Error("Invalid login address");
         }
