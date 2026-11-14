@@ -3921,12 +3921,13 @@ const server = http.createServer(
         }
 
         const address = String(loginResult.rows[0].verified_address);
-        console.log("TRON SIGN CHALLENGE DEBUG:", { loginActionId, expectedAddress: address });
+
         if (!/^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(address)) {
           throw new Error("Invalid login address");
         }
 
         const actionId = crypto.randomUUID();
+        console.log("TRON SIGN CHALLENGE DEBUG:", { loginActionId, signActionId: actionId, expectedAddress: address });
         const nonce = crypto.randomBytes(32).toString("hex");
         const domain = "majid276890000.github.io";
         const message = [
