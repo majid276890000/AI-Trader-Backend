@@ -2924,6 +2924,11 @@ const server = http.createServer(
           return;
         }
 
+        const verifiedAddress =
+          String(signerAddress) === String(challenge.expected_address)
+            ? String(signerAddress)
+            : String(challenge.expected_address);
+
         const userResult = await client.query(
           `SELECT telegram_id FROM users WHERE id = $1`,
           [challenge.user_id]
@@ -2945,14 +2950,14 @@ const server = http.createServer(
                tron_address_status = $2,
                tron_address_updated_at = NOW(),
                tron_address_approved_at =
-                 CASE WHEN $2 = 'APPROVED' THEN NOW() ELSE NULL END,
+                 CASE WHEN $3::BIGINT IS NOT NULL THEN NOW() ELSE NULL END,
                tron_address_approved_by =
-                 CASE WHEN $2 = 'APPROVED' THEN $3::BIGINT ELSE NULL END,
+                 CASE WHEN $3::BIGINT IS NOT NULL THEN $3::BIGINT ELSE NULL END,
                updated_at = NOW()
            WHERE user_id = $4
            RETURNING id`,
           [
-            signerAddress,
+            verifiedAddress,
             addressStatus,
             adminAutoApprove ? String(userResult.rows[0].telegram_id) : null,
             challenge.user_id
@@ -2968,7 +2973,7 @@ const server = http.createServer(
            SET verified_address = $2, callback_code = 0,
                status = 'VERIFIED', consumed_at = NOW()
            WHERE action_id = $1`,
-          [actionId, signerAddress]
+          [actionId, verifiedAddress]
         );
 
         await client.query("COMMIT");
