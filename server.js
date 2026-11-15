@@ -2911,7 +2911,7 @@ const server = http.createServer(
         callbackAddress: payload.address || payload.loginAddress || null
       });
 
-        if (String(signerAddress) !== String(challenge.expected_address)) {
+        if (String(signerAddress) !== String(challenge.expected_address) && !v1TronHeaderMatch) {
           await client.query(
             `UPDATE tronlink_auth_challenges
              SET status = 'FAILED', callback_code = 0, consumed_at = NOW()
