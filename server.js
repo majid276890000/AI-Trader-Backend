@@ -2875,6 +2875,32 @@ const server = http.createServer(
           challenge.challenge_message,
           payload.signedData
         );
+        const signatureHexMessage = Buffer.from(challenge.challenge_message, "utf8").toString("hex");
+        let v1TronHeaderMatch = false;
+        let v1EthereumHeaderMatch = false;
+
+        try {
+          await verifier.trx.verifyMessage(
+            signatureHexMessage, payload.signedData,
+            challenge.expected_address, true
+          );
+          v1TronHeaderMatch = true;
+        } catch {}
+
+        try {
+          await verifier.trx.verifyMessage(
+            signatureHexMessage, payload.signedData,
+            challenge.expected_address, false
+          );
+          v1EthereumHeaderMatch = true;
+        } catch {}
+
+        console.log("TRON SIGN FORMAT DIAGNOSTIC:", {
+          v2RecoveredAddress: String(signerAddress),
+          expectedAddress: String(challenge.expected_address),
+          v1TronHeaderMatch,
+          v1EthereumHeaderMatch
+        });
         console.log("TRON SIGN DEBUG:", {
         callbackActionId: actionId,
         signerAddress: String(signerAddress),
