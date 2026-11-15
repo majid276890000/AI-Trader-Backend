@@ -4038,13 +4038,48 @@ const server = http.createServer(
       try {
         const result = await getOrCreateTelegramWallet(telegramUser);
         const wallet = result.wallet;
+        let usdtBalance = null;
+
+        if (wallet.tron_address && /^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(wallet.tron_address)) {
+          try {
+            const fullNode = String(process.env.TRON_FULLNODE || "https://api.trongrid.io").trim().replace(/\/+$/, "");
+            const contract = String(process.env.TRON_USDT_CONTRACT || "").trim();
+            if (contract) {
+              const tronWeb = new TronWeb({ fullHost: fullNode });
+              const parameter = tronWeb.utils.abi.encodeParams(["address"], [wallet.tron_address]).replace(/^0x/, "");
+              const response = await fetch(fullNode + "/wallet/triggerconstantcontract", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  owner_address: wallet.tron_address,
+                  contract_address: contract,
+                  function_selector: "balanceOf(address)",
+                  parameter,
+                  call_value: 0,
+                  visible: true
+                })
+              });
+              const data = await response.json();
+              const hex = data.constant_result?.[0];
+              if (response.ok && data.result?.result === true && hex) {
+                const raw = BigInt("0x" + hex).toString();
+                const whole = raw.slice(0, -6) || "0";
+                const fraction = raw.slice(-6).padStart(6, "0").replace(/0+$/, "");
+                usdtBalance = fraction ? whole + "." + fraction : whole;
+              }
+            }
+          } catch (balanceError) {
+            console.log("TRON USDT BALANCE ERROR:", balanceError.message);
+          }
+        }
 
         res.end(JSON.stringify({
           ok: true,
           network: wallet.tron_network || "TRC20",
           address: wallet.tron_address || null,
           addressStatus: wallet.tron_address_status || "PENDING",
-          depositEnabled: wallet.deposit_enabled === true
+          depositEnabled: wallet.deposit_enabled === true,
+          usdtBalance
         }));
       } catch (error) {
         console.log("TRON ADDRESS GET ERROR:", error.message);
