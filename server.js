@@ -87,7 +87,13 @@ function isAdminTelegramUser(telegramUser) {
     return false;
   }
 
-  return String(telegramUser.id) === adminId;
+  const matches = String(telegramUser.id) === adminId;
+  console.log("ADMIN AUTH CHECK:", {
+    hasAdminId: Boolean(adminId),
+    hasTelegramUser: Boolean(telegramUser && telegramUser.id),
+    matches
+  });
+  return matches;
 }
 
 
