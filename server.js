@@ -124,6 +124,7 @@ async function getOrCreateTelegramWallet(telegramUser) {
         locked_balance,
         currency,
         tron_address,
+        tron_owner_address,
         tron_network,
         tron_address_status,
         deposit_enabled,
@@ -213,6 +214,9 @@ async function initDatabase() {
       ADD COLUMN IF NOT EXISTS tron_address TEXT;
 
       ALTER TABLE wallets
+      ADD COLUMN IF NOT EXISTS tron_owner_address TEXT;
+
+      ALTER TABLE wallets
       ADD COLUMN IF NOT EXISTS tron_address_status VARCHAR(20) NOT NULL DEFAULT 'PENDING';
 
       ALTER TABLE wallets
@@ -248,6 +252,7 @@ async function initDatabase() {
 
       ALTER TABLE wallet_transactions
       ADD COLUMN IF NOT EXISTS destination_address TEXT;
+      ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS blockchain_txid TEXT;
 
       CREATE TABLE IF NOT EXISTS trades (
         id SERIAL PRIMARY KEY,
@@ -274,6 +279,25 @@ async function initDatabase() {
 
       ALTER TABLE trades
       ADD COLUMN IF NOT EXISTS reconciliation_status VARCHAR(30) NOT NULL DEFAULT 'PENDING';
+
+      CREATE TABLE IF NOT EXISTS subscriptions (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id),
+        amount NUMERIC(20,6) NOT NULL DEFAULT 15,
+        currency VARCHAR(10) NOT NULL DEFAULT 'USDT',
+        network VARCHAR(20) NOT NULL DEFAULT 'TRC20',
+        duration_days INTEGER NOT NULL DEFAULT 90,
+        status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
+        txid TEXT UNIQUE,
+        payer_address TEXT,
+        expires_at TIMESTAMP,
+        approved_by BIGINT,
+        approved_at TIMESTAMP,
+        created_at TIMESTAMP NOT NULL DEFAULT NOW()
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_subscriptions_user
+      ON subscriptions(user_id, created_at DESC);
 
       INSERT INTO users (telegram_id)
       VALUES (999999999)
@@ -620,7 +644,8 @@ async function verifyTronUsdtTransaction({
 // =========================
 async function verifyTronUsdtDeposit({
   blockchainTxid,
-  destinationAddress
+  destinationAddress,
+  requireSingleTransfer = false
 }) {
   const txid = String(blockchainTxid || "").trim();
   const destination = String(destinationAddress || "").trim();
@@ -769,6 +794,8 @@ async function verifyTronUsdtDeposit({
   const transferTopic =
     "ddf252ad1be2c89b69c2b068fc378daa951ba7f163c4a11628f55a4df523b3ef";
 
+  const matchingTransfers = [];
+
   for (const log of logs) {
     const logAddress =
       normalizeDepositTronHexAddress(
@@ -840,7 +867,7 @@ async function verifyTronUsdtDeposit({
       continue;
     }
 
-    return {
+    const matchedTransfer = {
       verified: true,
       final: true,
       reason: "Verified TRC20 USDT deposit",
@@ -850,6 +877,21 @@ async function verifyTronUsdtDeposit({
       from: fromAddress,
       destination: toAddress
     };
+
+    if (!requireSingleTransfer) return matchedTransfer;
+    matchingTransfers.push(matchedTransfer);
+    continue;
+  }
+
+  if (requireSingleTransfer) {
+    if (matchingTransfers.length !== 1) {
+      return {
+        verified: false,
+        final: true,
+        reason: "Subscription requires exactly one USDT transfer to treasury"
+      };
+    }
+    return matchingTransfers[0];
   }
 
   return {
@@ -2946,6 +2988,7 @@ const server = http.createServer(
         const walletResult = await client.query(
           `UPDATE wallets
            SET tron_address = $1,
+               tron_owner_address = $1,
                tron_network = 'TRC20',
                tron_address_status = $2,
                tron_address_updated_at = NOW(),
@@ -4093,6 +4136,54 @@ const server = http.createServer(
       return;
     }
 
+    // SUBSCRIPTION STATUS
+    if (req.method === "GET" && req.url === "/subscription/status") {
+      const telegramUser = getTelegramUserFromRequest(req);
+      if (!telegramUser) {
+        res.end(JSON.stringify({ok:false, message:"Telegram authentication required"}));
+        return;
+      }
+      try {
+        const account = await getOrCreateTelegramWallet(telegramUser);
+        const result = await pool.query(
+          `SELECT id, amount, currency, network, duration_days,
+                  status, created_at, approved_at, expires_at
+           FROM subscriptions
+           WHERE user_id = $1
+           ORDER BY
+             CASE
+               WHEN status = 'APPROVED' AND expires_at > NOW() THEN 0
+               ELSE 1
+             END,
+             created_at DESC, id DESC
+           LIMIT 1`,
+          [account.user.id]
+        );
+        const subscription = result.rows[0] || null;
+        const active = Boolean(
+          subscription &&
+          subscription.status === "APPROVED" &&
+          subscription.expires_at &&
+          new Date(subscription.expires_at) > new Date()
+        );
+        res.end(JSON.stringify({
+          ok:true,
+          active,
+          status: subscription ? subscription.status : "NONE",
+          subscription,
+          treasuryAddress: String(process.env.TRON_TREASURY_ADDRESS || "").trim(),
+          expiresAt: subscription?.expires_at || null,
+          latestPaymentStatus: subscription?.status === "PENDING"
+            ? "PENDING_ADMIN"
+            : (subscription?.status || null)
+        }));
+      } catch (error) {
+        console.log("SUBSCRIPTION STATUS ERROR:", error.message);
+        res.end(JSON.stringify({ok:false, message:"Could not load subscription status"}));
+      }
+      return;
+    }
+
     if (
       req.method === "POST" &&
       req.url === "/wallet-tron-address"
@@ -4191,6 +4282,170 @@ const server = http.createServer(
     }
 
     // =========================
+
+    // =========================
+    // SUBSCRIPTION PAYMENT - TRC20
+    // =========================
+    if (req.method === "POST" && req.url === "/subscription/pay-tron") {
+      const telegramUser = getTelegramUserFromRequest(req);
+      if (!telegramUser) {
+        res.end(JSON.stringify({ok:false, message:"Telegram authentication required"}));
+        return;
+      }
+
+      let client;
+      let transactionStarted = false;
+      try {
+        const body = await readJsonBody(req);
+        const txid = String(body.txid || "").trim().toLowerCase();
+
+        if (!/^[a-f0-9]{64}$/.test(txid)) {
+          res.end(JSON.stringify({ok:false, message:"Invalid TRON transaction ID"}));
+          return;
+        }
+
+        const treasuryAddress = String(process.env.TRON_TREASURY_ADDRESS || "").trim();
+        if (!/^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(treasuryAddress)) {
+          res.end(JSON.stringify({ok:false, message:"Subscription treasury address is not configured"}));
+          return;
+        }
+
+        const walletData = await getOrCreateTelegramWallet(telegramUser);
+        if (!walletData || !walletData.wallet) {
+          res.end(JSON.stringify({ok:false, message:"Telegram user wallet not found"}));
+          return;
+        }
+
+        const verification = await verifyTronUsdtDeposit({
+          blockchainTxid: txid,
+          destinationAddress: treasuryAddress,
+          requireSingleTransfer: true
+        });
+
+        if (!verification.verified) {
+          res.end(JSON.stringify({
+            ok:false,
+            message:verification.reason || "Subscription payment verification failed"
+          }));
+          return;
+        }
+
+        if (String(verification.amountRaw) !== "15000000") {
+          res.end(JSON.stringify({
+            ok:false,
+            message:"Subscription payment must be exactly 15 USDT",
+            verifiedAmount:verification.amount
+          }));
+          return;
+        }
+
+        const verifiedWalletAddress = String(
+        walletData.wallet.tron_owner_address || ""
+      ).trim();
+
+      if (
+        !verifiedWalletAddress ||
+        String(verification.from || "").trim() !== verifiedWalletAddress
+      ) {
+        res.end(JSON.stringify({
+          ok:false,
+          message:"Payment sender does not match your verified TronLink wallet"
+        }));
+        return;
+      }
+
+      client = await pool.connect();
+        await client.query("BEGIN");
+        transactionStarted = true;
+
+        await client.query(
+          "SELECT pg_advisory_xact_lock(hashtext($1))",
+          [txid]
+        );
+
+        const duplicate = await client.query(
+          `SELECT id, 'WALLET_TRANSACTION' AS source
+           FROM wallet_transactions WHERE lower(blockchain_txid) = $1
+           UNION ALL
+           SELECT id, 'SUBSCRIPTION' AS source
+           FROM subscriptions WHERE lower(txid) = $1
+           LIMIT 1`,
+          [txid]
+        );
+
+        if (duplicate.rows.length) {
+          await client.query("ROLLBACK");
+          transactionStarted = false;
+          res.end(JSON.stringify({
+            ok:false,
+            message:"This transaction has already been used",
+            source:duplicate.rows[0].source
+          }));
+          return;
+        }
+
+        await client.query(
+          "SELECT pg_advisory_xact_lock(hashtext('subscription-user:' || $1::text))",
+          [walletData.wallet.user_id]
+        );
+
+        const existingSubscription = await client.query(
+          `SELECT id, status
+           FROM subscriptions
+           WHERE user_id = $1
+             AND (
+               status = 'PENDING'
+               OR (status = 'APPROVED' AND expires_at > NOW())
+             )
+           LIMIT 1`,
+          [walletData.wallet.user_id]
+        );
+
+        if (existingSubscription.rows.length) {
+          await client.query("ROLLBACK");
+          transactionStarted = false;
+          res.end(JSON.stringify({
+            ok:false,
+            message: existingSubscription.rows[0].status === "PENDING"
+              ? "You already have a subscription payment awaiting review"
+              : "You already have an active subscription"
+          }));
+          return;
+        }
+
+        const result = await client.query(
+          `INSERT INTO subscriptions
+           (user_id, amount, currency, network, duration_days, status, txid, payer_address)
+           VALUES ($1, 15, 'USDT', 'TRC20', 90, 'PENDING', $2, $3)
+           RETURNING id, amount, currency, network, duration_days, status, txid, created_at`,
+          [
+            walletData.wallet.user_id,
+            txid,
+            verification.from || null
+          ]
+        );
+
+        await client.query("COMMIT");
+        transactionStarted = false;
+
+        res.end(JSON.stringify({
+          ok:true,
+          message:"Payment verified; subscription is awaiting admin approval",
+          subscription:result.rows[0]
+        }));
+      } catch (error) {
+        if (client && transactionStarted) {
+          await client.query("ROLLBACK").catch(() => {});
+          transactionStarted = false;
+        }
+        console.log("SUBSCRIPTION PAYMENT ERROR:", error.message);
+        res.end(JSON.stringify({ok:false, message:"Could not register subscription payment"}));
+      } finally {
+        if (client) client.release();
+      }
+      return;
+    }
+
     // WALLET DEPOSIT - REAL TRC20
     // =========================
     const depositUrl = new URL(req.url, "http://localhost");
@@ -4212,8 +4467,7 @@ const server = http.createServer(
       try {
         const body = await readJsonBody(req);
 
-        const txid =
-          String(body.txid || "").trim();
+        const txid = String(body.txid || "").trim().toLowerCase();
 
         if (!/^[a-fA-F0-9]{64}$/.test(txid)) {
           res.end(JSON.stringify({
@@ -4256,7 +4510,7 @@ const server = http.createServer(
           await pool.query(
             `SELECT id, user_id, amount, status
              FROM wallet_transactions
-             WHERE blockchain_txid = $1
+             WHERE lower(blockchain_txid) = $1
              LIMIT 1`,
             [txid]
           );
@@ -4293,7 +4547,9 @@ const server = http.createServer(
         try {
           await client.query("BEGIN");
 
-          const walletResult =
+          await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [txid]);
+
+        const walletResult =
             await client.query(
               `SELECT
                  id,
@@ -4339,11 +4595,15 @@ const server = http.createServer(
 
           const duplicate =
             await client.query(
-              `SELECT id
-               FROM wallet_transactions
-               WHERE blockchain_txid = $1
-               FOR UPDATE`,
-              [txid]
+              `SELECT id, 'WALLET_TRANSACTION' AS source
+             FROM wallet_transactions
+             WHERE lower(blockchain_txid) = $1
+             UNION ALL
+             SELECT id, 'SUBSCRIPTION' AS source
+             FROM subscriptions
+             WHERE lower(txid) = $1
+             LIMIT 1`,
+            [txid]
             );
 
           if (duplicate.rows.length > 0) {
@@ -5951,6 +6211,123 @@ if (confirmUrl.pathname === "/wallet-confirm-withdraw") {
     }
 
     // =========================
+
+    // =========================
+    // ADMIN SUBSCRIPTION PENDING LIST
+    // =========================
+    if (req.method === "GET" && req.url === "/admin/subscriptions-pending") {
+      const adminUser = getTelegramUserFromRequest(req);
+      if (!adminUser || !isAdminTelegramUser(adminUser)) {
+        res.end(JSON.stringify({ok:false, message:"Admin access required"}));
+        return;
+      }
+      try {
+        const result = await pool.query(`
+          SELECT s.id, s.user_id, u.telegram_id, s.amount, s.currency,
+                 s.network, s.duration_days, s.status, s.txid,
+                 s.payer_address, s.created_at
+          FROM subscriptions s
+          JOIN users u ON u.id = s.user_id
+          WHERE s.status = 'PENDING'
+          ORDER BY s.created_at ASC
+        `);
+        res.end(JSON.stringify({
+          ok:true,
+          count:result.rows.length,
+          subscriptions:result.rows
+        }));
+      } catch (error) {
+        console.log("ADMIN SUBSCRIPTION LIST ERROR:", error.message);
+        res.end(JSON.stringify({ok:false, message:"Could not load pending subscriptions"}));
+      }
+      return;
+    }
+
+    // =========================
+    // ADMIN SUBSCRIPTION APPROVE / REJECT
+    // =========================
+    if (
+      req.method === "POST" &&
+      (req.url === "/admin/subscription-approve" ||
+       req.url === "/admin/subscription-reject")
+    ) {
+      const adminUser = getTelegramUserFromRequest(req);
+      if (!adminUser || !isAdminTelegramUser(adminUser)) {
+        res.end(JSON.stringify({ok:false, message:"Admin access required"}));
+        return;
+      }
+
+      let client;
+      let transactionStarted = false;
+      try {
+        const body = await readJsonBody(req);
+        const subscriptionId = Number(body.subscriptionId);
+        if (!Number.isInteger(subscriptionId) || subscriptionId <= 0) {
+          res.end(JSON.stringify({ok:false, message:"Invalid subscriptionId"}));
+          return;
+        }
+
+        const approve = req.url === "/admin/subscription-approve";
+        const status = approve ? "APPROVED" : "REJECTED";
+
+        client = await pool.connect();
+        await client.query("BEGIN");
+        transactionStarted = true;
+
+        const current = await client.query(
+          `SELECT id, status, duration_days
+           FROM subscriptions
+           WHERE id = $1
+           FOR UPDATE`,
+          [subscriptionId]
+        );
+
+        if (!current.rows.length || current.rows[0].status !== "PENDING") {
+          await client.query("ROLLBACK");
+          transactionStarted = false;
+          res.end(JSON.stringify({
+            ok:false,
+            message:"Subscription not found or already reviewed"
+          }));
+          return;
+        }
+
+        const result = await client.query(
+          `UPDATE subscriptions
+           SET status = $1,
+               approved_by = CASE WHEN $1 = 'APPROVED' THEN $2::BIGINT ELSE NULL END,
+               approved_at = CASE WHEN $1 = 'APPROVED' THEN NOW() ELSE NULL END,
+               expires_at = CASE
+                 WHEN $1 = 'APPROVED'
+                 THEN NOW() + (duration_days * INTERVAL '1 day')
+                 ELSE NULL
+               END
+           WHERE id = $3
+           RETURNING id, user_id, amount, currency, duration_days,
+                     status, approved_at, expires_at`,
+          [status, Number(adminUser.id), subscriptionId]
+        );
+
+        await client.query("COMMIT");
+        transactionStarted = false;
+        res.end(JSON.stringify({
+          ok:true,
+          action:status,
+          subscription:result.rows[0]
+        }));
+      } catch (error) {
+        if (client && transactionStarted) {
+          await client.query("ROLLBACK").catch(() => {});
+          transactionStarted = false;
+        }
+        console.log("ADMIN SUBSCRIPTION REVIEW ERROR:", error.message);
+        res.end(JSON.stringify({ok:false, message:"Could not review subscription"}));
+      } finally {
+        if (client) client.release();
+      }
+      return;
+    }
+
     // ADMIN DEPOSIT ADDRESS SET
     // =========================
     if (
