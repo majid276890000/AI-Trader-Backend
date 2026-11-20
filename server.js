@@ -2800,7 +2800,9 @@ const server = http.createServer(
           );
 
           if (!response.ok) {
+            const wallexError = await response.text();
             console.error("WALLEX VERIFY HTTP STATUS:", response.status);
+            console.error("WALLEX VERIFY ERROR BODY:", wallexError.slice(0, 1000));
             res.writeHead(400, {"Content-Type": "application/json; charset=utf-8"});
             res.end(JSON.stringify({
               ok: false,
