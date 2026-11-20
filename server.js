@@ -10,6 +10,7 @@ if (START_TELEGRAM_BOT && BOT_TOKEN) {
 }
 
 const WALLEX_API_KEY = process.env.WALLEX_API_KEY;
+const WALLEX_ENCRYPTION_KEY = process.env.WALLEX_ENCRYPTION_KEY;
 const REAL_TRADE_ENABLED = process.env.REAL_TRADE_ENABLED === "true";
 console.log("TRON ENV RUNTIME STATUS:", {
   TRON_FULLNODE: Boolean(String(process.env.TRON_FULLNODE || "https://api.trongrid.io").trim()),
@@ -20,6 +21,47 @@ console.log("TRON ENV RUNTIME STATUS:", {
 const crypto = require("crypto");
 const { Pool } = require("pg");
 const { TronWeb } = require("tronweb");
+
+function getWallexEncryptionKey() {
+  const key = Buffer.from(WALLEX_ENCRYPTION_KEY || "", "base64");
+  if (key.length !== 32) {
+    throw new Error("WALLEX_ENCRYPTION_KEY must be a valid 32-byte base64 key");
+  }
+  return key;
+}
+
+function encryptWallexApiKey(apiKey) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", getWallexEncryptionKey(), iv);
+  const encrypted = Buffer.concat([
+    cipher.update(String(apiKey), "utf8"),
+    cipher.final()
+  ]);
+  return [
+    "v1",
+    iv.toString("base64"),
+    cipher.getAuthTag().toString("base64"),
+    encrypted.toString("base64")
+  ].join(":");
+}
+
+function decryptWallexApiKey(payload) {
+  const [version, ivText, tagText, encryptedText] = String(payload).split(":");
+  if (version !== "v1" || !ivText || !tagText || !encryptedText) {
+    throw new Error("Invalid encrypted Wallex API key");
+  }
+  const decipher = crypto.createDecipheriv(
+    "aes-256-gcm",
+    getWallexEncryptionKey(),
+    Buffer.from(ivText, "base64")
+  );
+  decipher.setAuthTag(Buffer.from(tagText, "base64"));
+  return Buffer.concat([
+    decipher.update(Buffer.from(encryptedText, "base64")),
+    decipher.final()
+  ]).toString("utf8");
+}
+
 
 
 function validateTelegramInitData(initData) {
@@ -187,6 +229,16 @@ async function initDatabase() {
         id SERIAL PRIMARY KEY,
         telegram_id BIGINT UNIQUE NOT NULL,
         created_at TIMESTAMP DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS wallex_connections (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+        encrypted_api_key TEXT NOT NULL,
+        status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
+        verified_at TIMESTAMP,
+        created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMP NOT NULL DEFAULT NOW()
       );
 
       CREATE TABLE IF NOT EXISTS tronlink_auth_challenges (
@@ -2677,6 +2729,120 @@ const server = http.createServer(
       "Content-Type, X-Telegram-Init-Data"
     );
 
+    if (req.method === "OPTIONS") {
+      res.end();
+      return;
+    }
+
+
+    // WALLEX USER CONNECTION
+    if (
+      req.url === "/wallex/connect" ||
+      req.url === "/wallex/status" ||
+      req.url === "/wallex/disconnect"
+    ) {
+      const telegramUser = getTelegramUserFromRequest(req);
+
+      if (!telegramUser) {
+        res.writeHead(401, {"Content-Type": "application/json; charset=utf-8"});
+        res.end(JSON.stringify({ok: false, message: "Telegram authentication required"}));
+        return;
+      }
+
+      try {
+        const account = await getOrCreateTelegramWallet(telegramUser);
+        if (!account || !account.user) {
+          throw new Error("User lookup failed");
+        }
+
+        const userId = account.user.id;
+
+        if (req.method === "GET" && req.url === "/wallex/status") {
+          const result = await pool.query(
+            "SELECT status, verified_at FROM wallex_connections WHERE user_id = $1",
+            [userId]
+          );
+
+          res.writeHead(200, {"Content-Type": "application/json; charset=utf-8"});
+          res.end(JSON.stringify({
+            ok: true,
+            connected: result.rows[0]?.status === "CONNECTED",
+            status: result.rows[0]?.status || "DISCONNECTED",
+            verifiedAt: result.rows[0]?.verified_at || null
+          }));
+          return;
+        }
+
+        if (req.method === "POST" && req.url === "/wallex/disconnect") {
+          await pool.query(
+            "DELETE FROM wallex_connections WHERE user_id = $1",
+            [userId]
+          );
+
+          res.writeHead(200, {"Content-Type": "application/json; charset=utf-8"});
+          res.end(JSON.stringify({ok: true, status: "DISCONNECTED"}));
+          return;
+        }
+
+        if (req.method === "POST" && req.url === "/wallex/connect") {
+          const body = await readJsonBody(req);
+          const apiKey = String(body.apiKey || "").trim();
+
+          if (apiKey.length < 10 || apiKey.length > 512) {
+            res.writeHead(400, {"Content-Type": "application/json; charset=utf-8"});
+            res.end(JSON.stringify({ok: false, message: "Invalid API key"}));
+            return;
+          }
+
+          const response = await fetch(
+            "https://api.wallex.ir/v1/account/balances",
+            {headers: {"X-API-Key": apiKey}}
+          );
+
+          if (!response.ok) {
+            res.writeHead(400, {"Content-Type": "application/json; charset=utf-8"});
+            res.end(JSON.stringify({ok: false, message: "Wallex API key verification failed"}));
+            return;
+          }
+
+          const data = await response.json();
+          if (!data?.result?.balances || typeof data.result.balances !== "object") {
+            res.writeHead(400, {"Content-Type": "application/json; charset=utf-8"});
+            res.end(JSON.stringify({ok: false, message: "Unexpected Wallex response"}));
+            return;
+          }
+
+          const encryptedKey = encryptWallexApiKey(apiKey);
+
+          await pool.query(`
+            INSERT INTO wallex_connections
+              (user_id, encrypted_api_key, status, verified_at, updated_at)
+            VALUES ($1, $2, 'CONNECTED', NOW(), NOW())
+            ON CONFLICT (user_id)
+            DO UPDATE SET
+              encrypted_api_key = EXCLUDED.encrypted_api_key,
+              status = 'CONNECTED',
+              verified_at = NOW(),
+              updated_at = NOW()
+          `, [userId, encryptedKey]);
+
+          res.writeHead(200, {"Content-Type": "application/json; charset=utf-8"});
+          res.end(JSON.stringify({ok: true, connected: true, status: "CONNECTED"}));
+          return;
+        }
+
+        res.writeHead(405, {"Content-Type": "application/json; charset=utf-8"});
+        res.end(JSON.stringify({ok: false, message: "Method not allowed"}));
+        return;
+
+      } catch (error) {
+        console.error("WALLEX USER CONNECTION ERROR:", error.message);
+        res.writeHead(500, {"Content-Type": "application/json; charset=utf-8"});
+        res.end(JSON.stringify({ok: false, message: "Wallex connection operation failed"}));
+        return;
+      }
+    }
+
     if (req.method === "GET" && req.url === "/wallex-trading-balance") {
       const adminUser = getTelegramUserFromRequest(req);
       if (!adminUser) {
@@ -2756,11 +2922,6 @@ const server = http.createServer(
         }));
       }
 
-      return;
-    }
-
-    if (req.method === "OPTIONS") {
-      res.end();
       return;
     }
 
