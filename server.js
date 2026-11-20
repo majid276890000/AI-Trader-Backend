@@ -2800,8 +2800,12 @@ const server = http.createServer(
           );
 
           if (!response.ok) {
+            console.error("WALLEX VERIFY HTTP STATUS:", response.status);
             res.writeHead(400, {"Content-Type": "application/json; charset=utf-8"});
-            res.end(JSON.stringify({ok: false, message: "Wallex API key verification failed"}));
+            res.end(JSON.stringify({
+              ok: false,
+              message: `Wallex API verification failed (HTTP ${response.status})`
+            }));
             return;
           }
 
