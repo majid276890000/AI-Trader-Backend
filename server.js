@@ -50,19 +50,32 @@ function decryptWallexApiKey(payload) {
   if (version !== "v1" || !ivText || !tagText || !encryptedText) {
     throw new Error("Invalid encrypted Wallex API key");
   }
+
   const decipher = crypto.createDecipheriv(
     "aes-256-gcm",
     getWallexEncryptionKey(),
     Buffer.from(ivText, "base64")
   );
   decipher.setAuthTag(Buffer.from(tagText, "base64"));
+
   return Buffer.concat([
     decipher.update(Buffer.from(encryptedText, "base64")),
     decipher.final()
   ]).toString("utf8");
 }
 
+async function getUserWallexApiKey(userId) {
+  const result = await pool.query(
+    "SELECT encrypted_api_key, status FROM wallex_connections WHERE user_id = $1",
+    [userId]
+  );
 
+  if (!result.rows.length || result.rows[0].status !== "CONNECTED") {
+    throw new Error("User Wallex account is not connected");
+  }
+
+  return decryptWallexApiKey(result.rows[0].encrypted_api_key);
+}
 
 function validateTelegramInitData(initData) {
   if (!BOT_TOKEN || !initData) return null;
@@ -1549,7 +1562,7 @@ async function executeAutoTradeSell(userId) {
 
     // دریافت قیمت OTC فروش از Wallex
     const otcQuote =
-      await getWallexOtcSellPrice();
+      await getWallexOtcSellPrice(userId);
 
     const sellPrice =
       Number(otcQuote.price);
@@ -1563,7 +1576,7 @@ async function executeAutoTradeSell(userId) {
 
     // بررسی موجودی واقعی BTC در Wallex قبل از SELL
     const wallexBalance =
-      await getWallexTradingBalance();
+      await getWallexTradingBalance(userId);
 
     const wallexAvailableBTC =
       Math.max(
@@ -1590,7 +1603,7 @@ async function executeAutoTradeSell(userId) {
 
     // ارسال SELL واقعی به Wallex
     const wallexResult =
-      await placeWallexOtcSell(sellQuantity);
+      await placeWallexOtcSell(sellQuantity, userId);
 
     const wallexOrder =
       wallexResult?.result;
@@ -1941,16 +1954,20 @@ async function getAIAnalysis() {
 // Wallex API - READ ONLY
 // =========================
 
-async function getWallexBalance() {
-  if (!WALLEX_API_KEY) {
-    throw new Error("WALLEX_API_KEY is not configured");
+async function getWallexBalance(userId = null) {
+  const apiKey = userId === null
+    ? WALLEX_API_KEY
+    : await getUserWallexApiKey(userId);
+
+  if (!apiKey) {
+    throw new Error("Wallex API key is not configured");
   }
 
   const response = await fetch(
     "https://api.wallex.ir/v1/account/balances",
     {
       headers: {
-        "X-API-Key": WALLEX_API_KEY
+        "X-API-Key": apiKey
       }
     }
   );
@@ -1968,8 +1985,8 @@ async function getWallexBalance() {
 // Wallex Trading Balance - READ ONLY
 // =========================
 
-async function getWallexTradingBalance() {
-  const data = await getWallexBalance();
+async function getWallexTradingBalance(userId = null) {
+  const data = await getWallexBalance(userId);
 
   const balances =
     data?.result?.balances ||
@@ -1995,16 +2012,14 @@ async function getWallexTradingBalance() {
 // =========================
 // Wallex OTC BUY PRICE
 // =========================
-async function getWallexOtcBuyPrice() {
-  if (!WALLEX_API_KEY) {
-    throw new Error("WALLEX_API_KEY is not configured");
-  }
+async function getWallexOtcBuyPrice(userId) {
+  const apiKey = await getUserWallexApiKey(userId);
 
   const response = await fetch(
     "https://api.wallex.ir/v1/account/otc/price?symbol=BTCUSDT&side=BUY",
     {
       headers: {
-        "X-API-Key": WALLEX_API_KEY
+        "X-API-Key": apiKey
       }
     }
   );
@@ -2039,10 +2054,8 @@ async function getWallexOtcBuyPrice() {
 // =========================
 // Wallex OTC BUY - REAL ORDER
 // =========================
-async function placeWallexOtcBuy(amount) {
-  if (!WALLEX_API_KEY) {
-    throw new Error("WALLEX_API_KEY is not configured");
-  }
+async function placeWallexOtcBuy(amount, userId) {
+  const apiKey = await getUserWallexApiKey(userId);
 
   if (!Number.isFinite(amount) || amount < 2) {
     throw new Error("Invalid OTC BUY amount: minimum is 2 USDT");
@@ -2054,7 +2067,7 @@ async function placeWallexOtcBuy(amount) {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "X-API-Key": WALLEX_API_KEY
+        "X-API-Key": apiKey
       },
       body: JSON.stringify({
         symbol: "BTCUSDT",
@@ -2152,7 +2165,7 @@ async function executeAutoTradeBuy(userId, maxAmount) {
       );
 
     const wallexBalance =
-      await getWallexTradingBalance();
+      await getWallexTradingBalance(userId);
 
     const wallexAvailableUSDT =
       Math.max(
@@ -2176,7 +2189,7 @@ async function executeAutoTradeBuy(userId, maxAmount) {
     }
 
     const otcQuote =
-      await getWallexOtcBuyPrice();
+      await getWallexOtcBuyPrice(userId);
 
     const expiresAtMs = Date.parse(otcQuote.expiresAt);
 
@@ -2190,7 +2203,7 @@ async function executeAutoTradeBuy(userId, maxAmount) {
       };
     }
 
-    const wallexResult = await placeWallexOtcBuy(amount);
+    const wallexResult = await placeWallexOtcBuy(amount, userId);
 
     const wallexOrder = wallexResult?.result;
 
@@ -2443,16 +2456,14 @@ async function executeAutoTradeBuy(userId, maxAmount) {
 // =========================
 // Wallex OTC SELL PRICE
 // =========================
-async function getWallexOtcSellPrice() {
-  if (!WALLEX_API_KEY) {
-    throw new Error("WALLEX_API_KEY is not configured");
-  }
+async function getWallexOtcSellPrice(userId) {
+  const apiKey = await getUserWallexApiKey(userId);
 
   const response = await fetch(
     "https://api.wallex.ir/v1/account/otc/price?symbol=BTCUSDT&side=SELL",
     {
       headers: {
-        "X-API-Key": WALLEX_API_KEY
+        "X-API-Key": apiKey
       }
     }
   );
@@ -2487,10 +2498,8 @@ async function getWallexOtcSellPrice() {
 // =========================
 // Wallex OTC SELL - REAL ORDER
 // =========================
-async function placeWallexOtcSell(amount) {
-  if (!WALLEX_API_KEY) {
-    throw new Error("WALLEX_API_KEY is not configured");
-  }
+async function placeWallexOtcSell(amount, userId) {
+  const apiKey = await getUserWallexApiKey(userId);
 
   if (!Number.isFinite(amount) || amount <= 0) {
     throw new Error("Invalid OTC SELL amount");
@@ -2502,7 +2511,7 @@ async function placeWallexOtcSell(amount) {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "X-API-Key": WALLEX_API_KEY
+        "X-API-Key": apiKey
       },
       body: JSON.stringify({
         symbol: "BTCUSDT",
@@ -2656,7 +2665,7 @@ async function runUserAutoTrade() {
         }
 
         const wallexBalance =
-          await getWallexTradingBalance();
+          await getWallexTradingBalance(user.user_id);
 
         const wallexAvailableUSDT =
           Math.max(
