@@ -2748,7 +2748,8 @@ const server = http.createServer(
     if (
       req.url === "/wallex/connect" ||
       req.url === "/wallex/status" ||
-      req.url === "/wallex/disconnect"
+      req.url === "/wallex/disconnect" ||
+      req.url === "/wallex-user-balance"
     ) {
       const telegramUser = getTelegramUserFromRequest(req);
 
@@ -2765,6 +2766,13 @@ const server = http.createServer(
         }
 
         const userId = account.user.id;
+
+        if (req.method === "GET" && req.url === "/wallex-user-balance") {
+          const balance = await getWallexTradingBalance(userId);
+          res.writeHead(200, {"Content-Type": "application/json; charset=utf-8"});
+          res.end(JSON.stringify({ok: true, source: "wallex", balance}));
+          return;
+        }
 
         if (req.method === "GET" && req.url === "/wallex/status") {
           const result = await pool.query(
