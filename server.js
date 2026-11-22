@@ -3823,89 +3823,83 @@ const server = http.createServer(
     // =========================
     if (req.url === "/analysis") {
       try {
-        const price =
-          await getBTCPrice();
+        const telegramUser = getTelegramUserFromRequest(req);
 
-        if (
-          priceHistory.length === 0 ||
-          priceHistory[priceHistory.length - 1] !== price
-        ) {
-          priceHistory.push(price);
+        if (!telegramUser) {
+          res.end(JSON.stringify({
+            ok: false,
+            error: "Telegram authentication required"
+          }));
+          return;
         }
 
-        if (priceHistory.length > 10) {
-          priceHistory.shift();
+        const walletData =
+          await getOrCreateTelegramWallet(telegramUser);
+
+        if (!walletData || !walletData.user) {
+          res.end(JSON.stringify({
+            ok: false,
+            error: "Telegram user not found"
+          }));
+          return;
         }
 
-        let signal = "WAIT";
-        let risk = "LOW";
-        let confidence = 60;
-        let trend = "NEUTRAL";
+        const analysis = await getAIAnalysis();
 
-        if (priceHistory.length >= 2) {
+        const tradeResult = await pool.query(`
+          SELECT price
+          FROM trades
+          WHERE user_id = $1
+            AND side = 'BUY'
+            AND status = 'OPEN'
+          ORDER BY id DESC
+          LIMIT 1
+        `, [walletData.user.id]);
 
-          const firstPrice =
-            priceHistory[0];
+        let signal = analysis.signal;
+        let positionChangePercent = null;
 
-          const changePercent =
-            ((price - firstPrice) /
-              firstPrice) * 100;
+        if (tradeResult.rows.length > 0) {
+          const buyPrice = Number(tradeResult.rows[0].price);
 
-          if (changePercent > 0.30) {
+          const walletResult = await pool.query(`
+            SELECT trading_mode
+            FROM wallets
+            WHERE user_id = $1
+            LIMIT 1
+          `, [walletData.user.id]);
 
-            trend = "UP";
+          const mode = String(
+            walletResult.rows[0]?.trading_mode || "LOW"
+          ).toUpperCase();
 
-            confidence =
-              Math.min(
-                85,
-                Math.round(
-                  65 +
-                  changePercent * 10
-                )
-              );
+          if (Number.isFinite(buyPrice) && buyPrice > 0) {
+            positionChangePercent =
+              ((analysis.price - buyPrice) / buyPrice) * 100;
 
-            signal =
-              confidence >= 70
-                ? "CHECK_BUY"
-                : "WAIT";
+            const profitTarget = mode === "HIGH" ? 1 : 0.5;
+            const lossLimit = mode === "LOW" ? -0.5 :
+              mode === "HIGH" ? -2 : -1;
 
-          } else if (
-            changePercent < -0.15
-          ) {
-
-            trend = "DOWN";
-            signal = "WAIT";
-            confidence = 70;
-
-          } else {
-
-            trend = "NEUTRAL";
-            signal = "WAIT";
-            confidence = 60;
+            if (
+              positionChangePercent >= profitTarget ||
+              positionChangePercent <= lossLimit
+            ) {
+              signal = "CHECK_SELL";
+            }
           }
         }
 
         res.end(JSON.stringify({
-          symbol: "BTC/USDT",
-          price: price,
-          signal: signal,
-          risk: risk,
-          confidence: confidence,
-          trend: trend,
-          samples: priceHistory.length
+          ...analysis,
+          signal,
+          positionChangePercent
         }));
 
       } catch (error) {
-
-        console.log(
-          "Analysis error:",
-          error.message
-        );
-
+        console.log("Analysis error:", error.message);
         res.end(JSON.stringify({
-          error: "Could not analyze BTC",
-          message:
-            "Temporary price service error"
+          error: "Could not analyze BTC"
         }));
       }
 
