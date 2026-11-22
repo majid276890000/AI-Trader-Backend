@@ -1855,105 +1855,194 @@ async function executeAutoTradeSell(userId) {
 // =========================
 // Internal AI Analysis
 // =========================
-async function getAIAnalysis() {
 
-  const price = await getBTCPrice();
+let cachedBTCAnalysisCandles = null;
+let cachedBTCAnalysisCandlesTime = 0;
+
+async function getBTCAnalysisCandles() {
+  if (
+    cachedBTCAnalysisCandles &&
+    Date.now() - cachedBTCAnalysisCandlesTime < 60000
+  ) {
+    return cachedBTCAnalysisCandles;
+  }
+
+  const to = Math.floor(Date.now() / 1000);
+  const from = to - 220 * 3600;
+
+  const response = await fetch(
+    `https://api.wallex.ir/v1/udf/history?symbol=BTCUSDT&resolution=60&from=${from}&to=${to}`
+  );
+
+  if (!response.ok) {
+    throw new Error(`Wallex candles HTTP ${response.status}`);
+  }
+
+  const data = await response.json();
 
   if (
-    priceHistory.length === 0 ||
-    priceHistory[priceHistory.length - 1] !== price
+    data?.s !== "ok" ||
+    !Array.isArray(data.c) ||
+    !Array.isArray(data.v)
   ) {
-    priceHistory.push(price);
+    throw new Error("Invalid Wallex candle data");
   }
 
-  if (priceHistory.length > 10) {
-    priceHistory.shift();
-  }
+  const count = Math.min(
+    data.t?.length || 0,
+    data.o?.length || 0,
+    data.h?.length || 0,
+    data.l?.length || 0,
+    data.c.length,
+    data.v.length
+  );
 
-  let signal = "WAIT";
-  let risk = "LOW";
-  let confidence = 60;
-  let trend = "NEUTRAL";
+  const candles = [];
 
-  if (priceHistory.length >= 3) {
-
-    const firstPrice = priceHistory[0];
-    const previousPrice =
-      priceHistory[priceHistory.length - 2];
-
-    const changePercent =
-      ((price - firstPrice) / firstPrice) * 100;
-
-    const recentChangePercent =
-      ((price - previousPrice) / previousPrice) * 100;
-
-    const risingSamples =
-      priceHistory.filter(
-        (value, index) =>
-          index > 0 &&
-          value > priceHistory[index - 1]
-      ).length;
-
-    const fallingSamples =
-      priceHistory.filter(
-        (value, index) =>
-          index > 0 &&
-          value < priceHistory[index - 1]
-      ).length;
-
-    console.log(
-      `AI SIGNAL CHECK: first=${firstPrice} current=${price} change=${changePercent.toFixed(4)}% recent=${recentChangePercent.toFixed(4)}% rising=${risingSamples} falling=${fallingSamples}`
-    );
+  for (let i = 0; i < count - 1; i++) {
+    const candle = {
+      time: Number(data.t[i]),
+      open: Number(data.o[i]),
+      high: Number(data.h[i]),
+      low: Number(data.l[i]),
+      close: Number(data.c[i]),
+      volume: Number(data.v[i])
+    };
 
     if (
-      changePercent > 0.30 &&
-      risingSamples >= fallingSamples &&
-      recentChangePercent >= 0
+      Number.isFinite(candle.close) && candle.close > 0 &&
+      Number.isFinite(candle.open) && candle.open > 0 &&
+      Number.isFinite(candle.volume) && candle.volume >= 0
     ) {
-
-      trend = "UP";
-
-      confidence =
-        Math.min(
-          85,
-          Math.round(
-            70 + changePercent * 8
-          )
-        );
-
-      signal =
-        confidence >= 70
-          ? "CHECK_BUY"
-          : "WAIT";
-
-    } else if (
-      changePercent < -0.15 &&
-      fallingSamples > risingSamples
-    ) {
-
-      trend = "DOWN";
-      signal = "WAIT";
-      confidence = 70;
-
-    } else {
-
-      trend = "NEUTRAL";
-      signal = "WAIT";
-      confidence = 60;
+      candles.push(candle);
     }
   }
 
-  return {
-    symbol: "BTC/USDT",
-    price,
-    signal,
-    risk,
-    confidence,
-    trend,
-    samples: priceHistory.length
-  };
+  if (candles.length < 50) {
+    throw new Error("Not enough completed BTC candles");
+  }
+
+  cachedBTCAnalysisCandles = candles;
+  cachedBTCAnalysisCandlesTime = Date.now();
+
+  return candles;
 }
 
+async function getAIAnalysis() {
+  const price = await getBTCPrice();
+
+  try {
+    const candles = await getBTCAnalysisCandles();
+    const closes = candles.map(c => c.close);
+
+    const average = values =>
+      values.reduce((sum, value) => sum + value, 0) / values.length;
+
+    const sma20 = average(closes.slice(-20));
+    const sma50 = average(closes.slice(-50));
+
+    const changes = [];
+    for (let i = closes.length - 14; i < closes.length; i++) {
+      changes.push(closes[i] - closes[i - 1]);
+    }
+
+    let avgGain = average(changes.slice(0, 14).map(value => Math.max(value, 0)));
+    let avgLoss = average(changes.slice(0, 14).map(value => Math.max(-value, 0)));
+
+    for (const change of changes.slice(14)) {
+      avgGain = (avgGain * 13 + Math.max(change, 0)) / 14;
+      avgLoss = (avgLoss * 13 + Math.max(-change, 0)) / 14;
+    }
+
+    const rsi = avgLoss === 0
+      ? (avgGain === 0 ? 50 : 100)
+      : 100 - (100 / (1 + avgGain / avgLoss));
+
+    const lastVolume = candles[candles.length - 1].volume;
+    const previousVolumes = candles
+      .slice(-21, -1)
+      .map(c => c.volume);
+    const averageVolume = average(previousVolumes);
+
+    const volumeRatio = averageVolume > 0
+      ? lastVolume / averageVolume
+      : null;
+
+    const lastClose = closes[closes.length - 1];
+
+    let trend = "NEUTRAL";
+    if (lastClose > sma20 && sma20 > sma50) {
+      trend = "UP";
+    } else if (lastClose < sma20 && sma20 < sma50) {
+      trend = "DOWN";
+    }
+
+    const volumeConfirmed =
+      volumeRatio !== null && volumeRatio >= 1;
+
+    const signal =
+      trend === "UP" &&
+      rsi >= 45 &&
+      rsi <= 68 &&
+      volumeConfirmed
+        ? "CHECK_BUY"
+        : "WAIT";
+
+    let confidence = 45;
+    if (trend === "UP") confidence += 15;
+    if (rsi >= 45 && rsi <= 68) confidence += 15;
+    if (volumeConfirmed) confidence += 15;
+    if (sma20 > sma50) confidence += 5;
+    confidence = Math.min(95, confidence);
+
+    let risk = "LOW";
+    if (rsi > 70 || rsi < 30) {
+      risk = "HIGH";
+    } else if (volumeRatio === null || volumeRatio < 0.7) {
+      risk = "MEDIUM";
+    }
+
+    if (priceHistory.length === 0 ||
+        priceHistory[priceHistory.length - 1] !== price) {
+      priceHistory.push(price);
+    }
+    if (priceHistory.length > 10) priceHistory.shift();
+
+    return {
+      symbol: "BTC/USDT",
+      price,
+      signal,
+      risk,
+      confidence,
+      trend,
+      samples: candles.length,
+      rsi: Number(rsi.toFixed(2)),
+      sma20: Number(sma20.toFixed(2)),
+      sma50: Number(sma50.toFixed(2)),
+      volumeRatio: volumeRatio === null
+        ? null
+        : Number(volumeRatio.toFixed(2)),
+      candleTime: candles[candles.length - 1].time
+    };
+
+  } catch (error) {
+    console.error("BTC TECHNICAL ANALYSIS ERROR:", error.message);
+
+    return {
+      symbol: "BTC/USDT",
+      price,
+      signal: "WAIT",
+      risk: "MEDIUM",
+      confidence: 50,
+      trend: "NEUTRAL",
+      samples: priceHistory.length,
+      rsi: null,
+      sma20: null,
+      sma50: null,
+      volumeRatio: null
+    };
+  }
+}
 
 // =========================
 // Wallex API - READ ONLY
