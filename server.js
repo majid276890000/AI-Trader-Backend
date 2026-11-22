@@ -189,6 +189,7 @@ async function getOrCreateTelegramWallet(telegramUser) {
         tron_network,
         tron_address_status,
         deposit_enabled,
+        bot_enabled,
         deposit_tron_address,
         deposit_tron_network
     `, [user.id]);
@@ -301,6 +302,9 @@ async function initDatabase() {
 
       ALTER TABLE wallets
       ADD COLUMN IF NOT EXISTS auto_trade_enabled BOOLEAN DEFAULT FALSE;
+
+      ALTER TABLE wallets
+      ADD COLUMN IF NOT EXISTS bot_enabled BOOLEAN NOT NULL DEFAULT FALSE;
 
 
       ALTER TABLE wallets
@@ -1466,6 +1470,7 @@ async function getAutoTradeUsers() {
       INNER JOIN wallets w
         ON w.user_id = u.id
       WHERE w.auto_trade_enabled = TRUE
+        AND w.bot_enabled = TRUE
     `);
 
   return result.rows;
@@ -3607,7 +3612,7 @@ const server = http.createServer(
 
         res.end(JSON.stringify({
           ok: true,
-          bot: botStatus,
+          bot: row.bot_enabled ? "active" : "stopped",
           balance: Number(balance.toFixed(2)),
           availableBalance: Number(availableBalance.toFixed(2)),
           lockedBalance: Number(lockedBalance.toFixed(2)),
@@ -3628,37 +3633,37 @@ const server = http.createServer(
     // =========================
     // START
     // =========================
-    if (req.url === "/start") {
+    if (req.url === "/start" || req.url === "/stop") {
       const telegramUser = getTelegramUserFromRequest(req);
+
       if (!telegramUser) {
         res.writeHead(401, {"Content-Type": "application/json; charset=utf-8"});
         res.end(JSON.stringify({ok: false, message: "Telegram authentication required"}));
         return;
       }
 
-      res.end(JSON.stringify({
-        message: "Bot started",
-        bot: botStatus
-      }));
+      try {
+        const walletData = await getOrCreateTelegramWallet(telegramUser);
+        const enabled = req.url === "/start";
 
-      return;
-    }
+        const result = await pool.query(`
+          UPDATE wallets
+          SET bot_enabled = $1,
+              updated_at = NOW()
+          WHERE user_id = $2
+          RETURNING bot_enabled
+        `, [enabled, walletData.user.id]);
 
-    // =========================
-    // STOP
-    // =========================
-    if (req.url === "/stop") {
-      const telegramUser = getTelegramUserFromRequest(req);
-      if (!telegramUser) {
-        res.writeHead(401, {"Content-Type": "application/json; charset=utf-8"});
-        res.end(JSON.stringify({ok: false, message: "Telegram authentication required"}));
-        return;
+        res.end(JSON.stringify({
+          ok: true,
+          bot: result.rows[0].bot_enabled ? "active" : "stopped",
+          message: enabled ? "Bot started" : "Bot stopped"
+        }));
+      } catch (error) {
+        console.log("BOT CONTROL ERROR:", error.message);
+        res.writeHead(500, {"Content-Type": "application/json; charset=utf-8"});
+        res.end(JSON.stringify({ok: false, message: "Bot control database error"}));
       }
-
-      res.end(JSON.stringify({
-        message: "Bot stopped",
-        bot: botStatus
-      }));
 
       return;
     }
