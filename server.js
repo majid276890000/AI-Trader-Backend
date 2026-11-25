@@ -4438,22 +4438,27 @@ const server = http.createServer(
           [account.user.id]
         );
         const subscription = result.rows[0] || null;
+        const isPermanentSubscription = String(telegramUser.id) === "6369377608";
         const active = Boolean(
-          subscription &&
-          subscription.status === "APPROVED" &&
-          subscription.expires_at &&
-          new Date(subscription.expires_at) > new Date()
+          isPermanentSubscription ||
+          (
+            subscription &&
+            subscription.status === "APPROVED" &&
+            subscription.expires_at &&
+            new Date(subscription.expires_at) > new Date()
+          )
         );
         res.end(JSON.stringify({
           ok:true,
           active,
-          status: subscription ? subscription.status : "NONE",
+          permanent: isPermanentSubscription,
+          status: isPermanentSubscription ? "APPROVED" : (subscription ? subscription.status : "NONE"),
           subscription,
           treasuryAddress: String(process.env.TRON_TREASURY_ADDRESS || "").trim(),
           expiresAt: subscription?.expires_at || null,
-          latestPaymentStatus: subscription?.status === "PENDING"
+          latestPaymentStatus: isPermanentSubscription ? null : (subscription?.status === "PENDING"
             ? "PENDING_ADMIN"
-            : (subscription?.status || null)
+            : (subscription?.status || null))
         }));
       } catch (error) {
         console.log("SUBSCRIPTION STATUS ERROR:", error.message);
@@ -4571,7 +4576,12 @@ const server = http.createServer(
         return;
       }
 
-      let client;
+      if (String(telegramUser.id) === "6369377608") {
+      res.end(JSON.stringify({ok:false, message:"Your subscription is permanent; no payment is required"}));
+      return;
+    }
+
+    let client;
       let transactionStarted = false;
       try {
         const body = await readJsonBody(req);
